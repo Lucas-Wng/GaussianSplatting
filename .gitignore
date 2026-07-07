@@ -1,0 +1,38 @@
+# Build output
+/build/
+build/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cmake.stamp
+
+# Compiled shaders
+*.spv
+
+# Compiled objects / binaries / libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+compile_commands.json
+.cache/
+
+# macOS
+.DS_Store
+
+.claude/
