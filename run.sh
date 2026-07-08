@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$ROOT/build"
-APP_DIR="$BUILD_DIR/VulkanTutorial"
+APP_DIR="$BUILD_DIR/GaussianSplatting"
 
 if [[ "${1:-}" == "--clean" ]]; then
   echo ">> Removing build directory"
@@ -20,4 +20,4 @@ cmake --build "$BUILD_DIR"
 
 echo ">> Running (working dir: $APP_DIR)"
 cd "$APP_DIR"
-exec ./VulkanTutorial
+exec ./GaussianSplatting

@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 3.29)
 
-set (TEMPLATE_NAME "VulkanTutorial")
+set (TEMPLATE_NAME "GaussianSplatting")
 
 project (${TEMPLATE_NAME})
 
@@ -70,10 +70,10 @@ find_program(SLANGC_EXECUTABLE slangc HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
 
 set(TEMPLATE_DIR ${CMAKE_BINARY_DIR}/${TEMPLATE_NAME})
 
-add_executable (${TEMPLATE_NAME} src/main.cpp)
+add_executable (${TEMPLATE_NAME} src/main.cpp src/ply_loader.cpp)
 set_target_properties (${TEMPLATE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${TEMPLATE_DIR})
 set_target_properties (${TEMPLATE_NAME} PROPERTIES CXX_STANDARD 20)
-target_link_libraries (${TEMPLATE_NAME} Vulkan::cppm glfw)
+target_link_libraries (${TEMPLATE_NAME} Vulkan::cppm glfw glm::glm)
 
 # Add compile definition if C++ 20 module is enabled
 if(ENABLE_CPP20_MODULE)
@@ -105,3 +105,9 @@ add_custom_command(
 )
 add_custom_target(${SHADER_TARGET} DEPENDS ${SHADERS_DIR}/slang.spv)
 add_dependencies(${TEMPLATE_NAME} ${SHADER_TARGET})
+
+# Bundle every .ply in assets/ into the run directory's models/ folder
+file (GLOB SCENE_PLYS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/*.ply")
+if (SCENE_PLYS)
+  file (COPY ${SCENE_PLYS} DESTINATION ${TEMPLATE_DIR}/models)
+endif()

@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <array>
 #include <assert.h>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -21,8 +20,14 @@ import vulkan_hpp;
 #include <GLFW/glfw3.h>
 
 #define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE        // Vulkan clip space depth is [0, 1]
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+
+#include "camera.hpp"
+#include "ply_loader.hpp"
+
+#include <string>
 
 constexpr uint32_t WIDTH                = 800;
 constexpr uint32_t HEIGHT               = 600;
@@ -37,44 +42,23 @@ constexpr bool enableValidationLayers = false;
 constexpr bool enableValidationLayers = true;
 #endif
 
-struct Vertex
-{
-	glm::vec2 pos;
-	glm::vec3 color;
-
-	static vk::VertexInputBindingDescription getBindingDescription()
-	{
-		return {.binding = 0, .stride = sizeof(Vertex), .inputRate = vk::VertexInputRate::eVertex};
-	}
-
-	static std::array<vk::VertexInputAttributeDescription, 2> getAttributeDescriptions()
-	{
-		return {{{.location = 0, .binding = 0, .format = vk::Format::eR32G32Sfloat, .offset = offsetof(Vertex, pos)},
-		         {.location = 1, .binding = 0, .format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(Vertex, color)}}};
-	}
-};
-
+// Camera data for the splat shader. Layout matches CameraUBO in shaders/shader.slang.
 struct UniformBufferObject
 {
-	glm::mat4 model;
 	glm::mat4 view;
 	glm::mat4 proj;
+	glm::vec2 viewport;        // framebuffer size in pixels
+	glm::vec2 focal;           // fx, fy in pixels
 };
 
-const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}};
-
-const std::vector<uint16_t> indices = {
-    0, 1, 2, 2, 3, 0};
-
-class HelloTriangleApplication
+class Application
 {
   public:
+	explicit Application(std::string plyPath) : plyPath(std::move(plyPath)) {}
+
 	void run()
 	{
+		loadScene();
 		initWindow();
 		initVulkan();
 		mainLoop();
@@ -82,6 +66,11 @@ class HelloTriangleApplication
 	}
 
   private:
+	std::string                      plyPath;
+	Scene                            scene;
+	uint32_t                         splatCount = 0;
+	Camera                           camera;
+
 	GLFWwindow                      *window = nullptr;
 	vk::raii::Context                context;
 	vk::raii::Instance               instance       = nullptr;
@@ -101,10 +90,16 @@ class HelloTriangleApplication
 	vk::raii::PipelineLayout      pipelineLayout      = nullptr;
 	vk::raii::Pipeline            graphicsPipeline    = nullptr;
 
-	vk::raii::Buffer       vertexBuffer       = nullptr;
-	vk::raii::DeviceMemory vertexBufferMemory = nullptr;
-	vk::raii::Buffer       indexBuffer        = nullptr;
-	vk::raii::DeviceMemory indexBufferMemory  = nullptr;
+	// All splats live in one device-local storage buffer, uploaded once.
+	vk::raii::Buffer       splatBuffer       = nullptr;
+	vk::raii::DeviceMemory splatBufferMemory = nullptr;
+
+	// Per-frame, host-visible, persistently-mapped sorted-index buffers (back-to-front order).
+	std::vector<vk::raii::Buffer>       indexBuffers;
+	std::vector<vk::raii::DeviceMemory> indexBuffersMemory;
+	std::vector<void *>                 indexBuffersMapped;
+	std::vector<uint32_t>               sortedIndices;        // CPU scratch reused each frame
+	std::vector<float>                  splatDepths;          // CPU scratch reused each frame
 
 	std::vector<vk::raii::Buffer>       uniformBuffers;
 	std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
@@ -123,8 +118,45 @@ class HelloTriangleApplication
 
 	bool framebufferResized = false;
 
+	// Mouse-look / timing state.
+	bool   firstMouse   = true;
+	double lastMouseX   = 0.0;
+	double lastMouseY   = 0.0;
+	float  deltaTime    = 0.0f;
+	double lastFrameTime = 0.0;
+
+	// Reconcile COLMAP's Y-down training frame with our Y-up world (toggle with F).
+	// 180 deg about X: negates Y and Z. Pure rotation, so covariances stay correct.
+	bool sceneUpFlip = true;
+	static constexpr glm::mat4 kSceneUpCorrection{1, 0, 0, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1};
+
+	glm::mat4 currentViewMatrix() const
+	{
+		return sceneUpFlip ? camera.viewMatrix() * kSceneUpCorrection : camera.viewMatrix();
+	}
+
 	std::vector<const char *> requiredDeviceExtension = {
 	    vk::KHRSwapchainExtensionName};
+
+	void loadScene()
+	{
+		scene      = loadPly(plyPath);
+		splatCount = static_cast<uint32_t>(scene.splats.size());
+		if (splatCount == 0)
+			throw std::runtime_error("ply contained no splats: " + plyPath);
+		std::cout << "loaded " << splatCount << " splats from " << plyPath << std::endl;
+
+		sortedIndices.resize(splatCount);
+		splatDepths.resize(splatCount);
+
+		// Place the camera just outside the scene, looking at its center.
+		glm::vec3 center = scene.center();
+		float     radius = std::max(scene.radius(), 0.5f);
+		camera.position  = center + glm::vec3(0.0f, 0.0f, radius * 2.5f);
+		camera.yaw       = -glm::half_pi<float>();
+		camera.pitch     = 0.0f;
+		camera.moveSpeed = radius;        // scale fly speed to the scene
+	}
 
 	void initWindow()
 	{
@@ -133,15 +165,46 @@ class HelloTriangleApplication
 		glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 		glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
 
-		window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+		window = glfwCreateWindow(WIDTH, HEIGHT, "Gaussian Splatting Viewer", nullptr, nullptr);
 		glfwSetWindowUserPointer(window, this);
 		glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+
+		// Capture the cursor for FPS-style mouse-look.
+		glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+		glfwSetCursorPosCallback(window, cursorPosCallback);
+		glfwSetKeyCallback(window, keyCallback);
 	}
 
 	static void framebufferResizeCallback(GLFWwindow *window, int width, int height)
 	{
-		auto app                = reinterpret_cast<HelloTriangleApplication *>(glfwGetWindowUserPointer(window));
+		auto app                = reinterpret_cast<Application *>(glfwGetWindowUserPointer(window));
 		app->framebufferResized = true;
+	}
+
+	static void cursorPosCallback(GLFWwindow *window, double xpos, double ypos)
+	{
+		auto app = reinterpret_cast<Application *>(glfwGetWindowUserPointer(window));
+		if (app->firstMouse)
+		{
+			app->lastMouseX = xpos;
+			app->lastMouseY = ypos;
+			app->firstMouse = false;
+			return;
+		}
+		float dx        = static_cast<float>(xpos - app->lastMouseX);
+		float dy        = static_cast<float>(ypos - app->lastMouseY);
+		app->lastMouseX = xpos;
+		app->lastMouseY = ypos;
+		app->camera.processMouse(dx, dy);
+	}
+
+	static void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods)
+	{
+		auto app = reinterpret_cast<Application *>(glfwGetWindowUserPointer(window));
+		if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+			glfwSetWindowShouldClose(window, GLFW_TRUE);
+		if (key == GLFW_KEY_F && action == GLFW_PRESS)
+			app->sceneUpFlip = !app->sceneUpFlip;
 	}
 
 	void initVulkan()
@@ -156,8 +219,8 @@ class HelloTriangleApplication
 		createDescriptorSetLayout();
 		createGraphicsPipeline();
 		createCommandPool();
-		createVertexBuffer();
-		createIndexBuffer();
+		createSplatBuffer();
+		createIndexBuffers();
 		createUniformBuffers();
 		createDescriptorPool();
 		createDescriptorSets();
@@ -167,13 +230,35 @@ class HelloTriangleApplication
 
 	void mainLoop()
 	{
+		lastFrameTime = glfwGetTime();
 		while (!glfwWindowShouldClose(window))
 		{
+			double now    = glfwGetTime();
+			deltaTime     = static_cast<float>(now - lastFrameTime);
+			lastFrameTime = now;
+
 			glfwPollEvents();
+			processInput();
 			drawFrame();
 		}
 
 		device.waitIdle();
+	}
+
+	void processInput()
+	{
+		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+			camera.processKeyboard(Camera::Move::Forward, deltaTime);
+		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+			camera.processKeyboard(Camera::Move::Backward, deltaTime);
+		if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+			camera.processKeyboard(Camera::Move::Left, deltaTime);
+		if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+			camera.processKeyboard(Camera::Move::Right, deltaTime);
+		if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
+			camera.processKeyboard(Camera::Move::Up, deltaTime);
+		if (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
+			camera.processKeyboard(Camera::Move::Down, deltaTime);
 	}
 
 	void cleanupSwapChain()
@@ -433,9 +518,17 @@ class HelloTriangleApplication
 
 	void createDescriptorSetLayout()
 	{
-		vk::DescriptorSetLayoutBinding uboLayoutBinding{
-		    .binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eVertex};
-		vk::DescriptorSetLayoutCreateInfo layoutInfo{.bindingCount = 1, .pBindings = &uboLayoutBinding};
+		std::array bindings{
+		    // binding 0: camera UBO
+		    vk::DescriptorSetLayoutBinding{
+		        .binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eVertex},
+		    // binding 1: splat data (read-only storage buffer)
+		    vk::DescriptorSetLayoutBinding{
+		        .binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eVertex},
+		    // binding 2: back-to-front sorted indices (read-only storage buffer)
+		    vk::DescriptorSetLayoutBinding{
+		        .binding = 2, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eVertex}};
+		vk::DescriptorSetLayoutCreateInfo layoutInfo{.bindingCount = static_cast<uint32_t>(bindings.size()), .pBindings = bindings.data()};
 		descriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
 	}
 
@@ -447,28 +540,33 @@ class HelloTriangleApplication
 		vk::PipelineShaderStageCreateInfo fragShaderStageInfo{.stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "fragMain"};
 		vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
 
-		auto                                     bindingDescription    = Vertex::getBindingDescription();
-		auto                                     attributeDescriptions = Vertex::getAttributeDescriptions();
-		vk::PipelineVertexInputStateCreateInfo   vertexInputInfo{.vertexBindingDescriptionCount   = 1,
-		                                                         .pVertexBindingDescriptions      = &bindingDescription,
-		                                                         .vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size()),
-		                                                         .pVertexAttributeDescriptions    = attributeDescriptions.data()};
-		vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
+		// No vertex buffer: quad corners come from gl_VertexIndex, splat data from an SSBO.
+		vk::PipelineVertexInputStateCreateInfo   vertexInputInfo{};
+		// primitiveRestartEnable must be true for strips on MoltenVK/Metal; harmless for our
+		// non-indexed draw.
+		vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleStrip, .primitiveRestartEnable = vk::True};
 		vk::PipelineViewportStateCreateInfo      viewportState{.viewportCount = 1, .scissorCount = 1};
 
 		vk::PipelineRasterizationStateCreateInfo rasterizer{.depthClampEnable        = vk::False,
 		                                                    .rasterizerDiscardEnable = vk::False,
 		                                                    .polygonMode             = vk::PolygonMode::eFill,
-		                                                    .cullMode                = vk::CullModeFlagBits::eBack,
+		                                                    .cullMode                = vk::CullModeFlagBits::eNone,        // billboards face the camera
 		                                                    .frontFace               = vk::FrontFace::eCounterClockwise,
 		                                                    .depthBiasEnable         = vk::False,
 		                                                    .lineWidth               = 1.0f};
 
 		vk::PipelineMultisampleStateCreateInfo multisampling{.rasterizationSamples = vk::SampleCountFlagBits::e1, .sampleShadingEnable = vk::False};
 
+		// Premultiplied-alpha "over" compositing for back-to-front splat blending.
 		vk::PipelineColorBlendAttachmentState colorBlendAttachment{
-		    .blendEnable    = vk::False,
-		    .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
+		    .blendEnable         = vk::True,
+		    .srcColorBlendFactor = vk::BlendFactor::eOne,
+		    .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+		    .colorBlendOp        = vk::BlendOp::eAdd,
+		    .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+		    .dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
+		    .alphaBlendOp        = vk::BlendOp::eAdd,
+		    .colorWriteMask      = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA};
 
 		vk::PipelineColorBlendStateCreateInfo colorBlending{
 		    .logicOpEnable = vk::False, .logicOp = vk::LogicOp::eCopy, .attachmentCount = 1, .pAttachments = &colorBlendAttachment};
@@ -514,38 +612,36 @@ class HelloTriangleApplication
 		return {std::move(buffer), std::move(bufferMemory)};
 	}
 
-	void createVertexBuffer()
+	void createSplatBuffer()
 	{
-		vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+		vk::DeviceSize bufferSize = sizeof(GpuSplat) * scene.splats.size();
 
 		auto [stagingBuffer, stagingBufferMemory] =
 		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
 
 		void *dataStaging = stagingBufferMemory.mapMemory(0, bufferSize);
-		memcpy(dataStaging, vertices.data(), bufferSize);
+		memcpy(dataStaging, scene.splats.data(), bufferSize);
 		stagingBufferMemory.unmapMemory();
 
-		std::tie(vertexBuffer, vertexBufferMemory) =
-		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
+		std::tie(splatBuffer, splatBufferMemory) =
+		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
 
-		copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+		copyBuffer(stagingBuffer, splatBuffer, bufferSize);
 	}
 
-	void createIndexBuffer()
+	void createIndexBuffers()
 	{
-		vk::DeviceSize bufferSize = sizeof(indices[0]) * indices.size();
-
-		auto [stagingBuffer, stagingBufferMemory] =
-		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-
-		void *data = stagingBufferMemory.mapMemory(0, bufferSize);
-		memcpy(data, indices.data(), (size_t) bufferSize);
-		stagingBufferMemory.unmapMemory();
-
-		std::tie(indexBuffer, indexBufferMemory) =
-		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
-
-		copyBuffer(stagingBuffer, indexBuffer, bufferSize);
+		// One host-visible, persistently-mapped index buffer per frame in flight. The
+		// per-frame sort writes back-to-front splat order here before rendering.
+		vk::DeviceSize bufferSize = sizeof(uint32_t) * splatCount;
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			auto [buffer, bufferMem] = createBuffer(
+			    bufferSize, vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+			indexBuffers.emplace_back(std::move(buffer));
+			indexBuffersMemory.emplace_back(std::move(bufferMem));
+			indexBuffersMapped.emplace_back(indexBuffersMemory.back().mapMemory(0, bufferSize));
+		}
 	}
 
 	void createUniformBuffers()
@@ -563,8 +659,13 @@ class HelloTriangleApplication
 
 	void createDescriptorPool()
 	{
-		vk::DescriptorPoolSize       poolSize{.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = MAX_FRAMES_IN_FLIGHT};
-		vk::DescriptorPoolCreateInfo poolInfo{.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, .maxSets = MAX_FRAMES_IN_FLIGHT, .poolSizeCount = 1, .pPoolSizes = &poolSize};
+		std::array poolSizes{
+		    vk::DescriptorPoolSize{.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = MAX_FRAMES_IN_FLIGHT},
+		    vk::DescriptorPoolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 2 * MAX_FRAMES_IN_FLIGHT}};        // splat + index per frame
+		vk::DescriptorPoolCreateInfo poolInfo{.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+		                                      .maxSets       = MAX_FRAMES_IN_FLIGHT,
+		                                      .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
+		                                      .pPoolSizes    = poolSizes.data()};
 		descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
 	}
 
@@ -579,14 +680,15 @@ class HelloTriangleApplication
 
 		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		{
-			vk::DescriptorBufferInfo bufferInfo{.buffer = uniformBuffers[i], .offset = 0, .range = sizeof(UniformBufferObject)};
-			vk::WriteDescriptorSet   descriptorWrite{.dstSet          = descriptorSets[i],
-			                                         .dstBinding      = 0,
-			                                         .dstArrayElement = 0,
-			                                         .descriptorCount = 1,
-			                                         .descriptorType  = vk::DescriptorType::eUniformBuffer,
-			                                         .pBufferInfo     = &bufferInfo};
-			device.updateDescriptorSets(descriptorWrite, {});
+			vk::DescriptorBufferInfo uboInfo{.buffer = uniformBuffers[i], .offset = 0, .range = sizeof(UniformBufferObject)};
+			vk::DescriptorBufferInfo splatInfo{.buffer = splatBuffer, .offset = 0, .range = sizeof(GpuSplat) * splatCount};
+			vk::DescriptorBufferInfo indexInfo{.buffer = indexBuffers[i], .offset = 0, .range = sizeof(uint32_t) * splatCount};
+
+			std::array descriptorWrites{
+			    vk::WriteDescriptorSet{.dstSet = descriptorSets[i], .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eUniformBuffer, .pBufferInfo = &uboInfo},
+			    vk::WriteDescriptorSet{.dstSet = descriptorSets[i], .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &splatInfo},
+			    vk::WriteDescriptorSet{.dstSet = descriptorSets[i], .dstBinding = 2, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &indexInfo}};
+			device.updateDescriptorSets(descriptorWrites, {});
 		}
 	}
 
@@ -654,10 +756,9 @@ class HelloTriangleApplication
 		commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
 		commandBuffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
 		commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
-		commandBuffer.bindVertexBuffers(0, *vertexBuffer, {0});
-		commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexTypeValue<decltype(indices)::value_type>::value);
 		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, *descriptorSets[frameIndex], nullptr);
-		commandBuffer.drawIndexed(static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+		// One instanced quad (4-vert triangle strip) per splat.
+		commandBuffer.draw(4, splatCount, 0, 0);
 		commandBuffer.endRendering();
 
 		// After rendering, transition the swapchain image to vk::ImageLayout::ePresentSrcKHR
@@ -721,21 +822,42 @@ class HelloTriangleApplication
 		}
 	}
 
+	static constexpr float kFovY = glm::radians(60.0f);
+
 	void updateUniformBuffer(uint32_t currentImage)
 	{
-		static auto startTime = std::chrono::high_resolution_clock::now();
-
-		auto  currentTime = std::chrono::high_resolution_clock::now();
-		float time        = std::chrono::duration<float>(currentTime - startTime).count();
+		float width  = static_cast<float>(swapChainExtent.width);
+		float height = static_cast<float>(swapChainExtent.height);
 
 		UniformBufferObject ubo{};
-		ubo.model = rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-		ubo.view  = lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
-		ubo.proj =
-		    glm::perspective(glm::radians(45.0f), static_cast<float>(swapChainExtent.width) / static_cast<float>(swapChainExtent.height), 0.1f, 10.0f);
-		ubo.proj[1][1] *= -1;
+		ubo.view = currentViewMatrix();
+		ubo.proj = glm::perspective(kFovY, width / height, 0.05f, 1000.0f);
+		ubo.proj[1][1] *= -1;        // GLM assumes OpenGL's flipped Y
+
+		// Focal lengths in pixels, consistent with the covariance projection Jacobian.
+		float fy       = height / (2.0f * std::tan(kFovY * 0.5f));
+		ubo.viewport   = glm::vec2(width, height);
+		ubo.focal      = glm::vec2(fy, fy);
 
 		memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+	}
+
+	// Sort splats back-to-front by camera-space depth and upload the order for this frame.
+	void sortSplats()
+	{
+		glm::mat4 view = currentViewMatrix();
+		// Depth = camera-space z. With -Z forward, more-negative z is farther away, so we
+		// sort ascending in z (far first) to get back-to-front order for "over" blending.
+		const glm::vec4 row2 = glm::vec4(view[0][2], view[1][2], view[2][2], view[3][2]);
+		for (uint32_t i = 0; i < splatCount; ++i)
+		{
+			const glm::vec3 &p = scene.splats[i].position;
+			splatDepths[i]     = row2.x * p.x + row2.y * p.y + row2.z * p.z + row2.w;
+			sortedIndices[i]   = i;
+		}
+		std::ranges::sort(sortedIndices, [this](uint32_t a, uint32_t b) { return splatDepths[a] < splatDepths[b]; });
+
+		memcpy(indexBuffersMapped[frameIndex], sortedIndices.data(), sizeof(uint32_t) * splatCount);
 	}
 
 	void drawFrame()
@@ -765,6 +887,7 @@ class HelloTriangleApplication
 			throw std::runtime_error("failed to acquire swap chain image!");
 		}
 		updateUniformBuffer(frameIndex);
+		sortSplats();
 
 		// Only reset the fence if we are submitting work
 		device.resetFences(*inFlightFences[frameIndex]);
@@ -898,11 +1021,14 @@ class HelloTriangleApplication
 	}
 };
 
-int main()
+int main(int argc, char **argv)
 {
+	// Path to a pretrained 3DGS .ply; defaults to the bundled cactus scene.
+	std::string plyPath = (argc > 1) ? argv[1] : "models/cactus.ply";
+
 	try
 	{
-		HelloTriangleApplication app;
+		Application app(plyPath);
 		app.run();
 	}
 	catch (const std::exception &e)
