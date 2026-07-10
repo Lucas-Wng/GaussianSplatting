@@ -1,9 +1,7 @@
-// 3D Gaussian Splatting — graphics-pipeline EWA splatting (Phase 1, no compute).
-//
-// Each Gaussian is drawn as one instanced quad (4 verts, triangle strip, no vertex
-// buffer). The vertex shader projects the splat's 3D covariance to a 2D screen-space
-// covariance and sizes the quad to ~3 sigma; the fragment shader evaluates the
-// Gaussian falloff and outputs premultiplied color for back-to-front alpha blending.
+// Graphics-pipeline EWA splatting. Each Gaussian is one instanced quad (4-vert triangle strip,
+// no vertex buffer): the vertex shader projects the 3D covariance to a 2D screen-space
+// covariance sized to ~3 sigma, the fragment shader evaluates the Gaussian falloff and outputs
+// premultiplied color for back-to-front alpha blending.
 
 struct CameraUBO
 {

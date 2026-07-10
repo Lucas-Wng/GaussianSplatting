@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <assert.h>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -51,6 +52,23 @@ struct UniformBufferObject
 	glm::vec2 focal;           // fx, fy in pixels
 };
 
+// Selects the back-to-front sort strategy; toggle at runtime with G.
+enum class SortMode
+{
+	Cpu,        // std::sort on the host, memcpy into the index buffer
+	Gpu         // compute bitonic sort, in place in the index buffer
+};
+
+// Must match SortPush in shaders/compute.slang.
+struct SortPushConstants
+{
+	glm::vec4 viewRow2;        // z = dot(viewRow2.xyz, pos) + viewRow2.w
+	uint32_t  splatCount;
+	uint32_t  paddedCount;
+	uint32_t  j;               // bitonic partner stride
+	uint32_t  k;               // bitonic subsequence size
+};
+
 class Application
 {
   public:
@@ -68,7 +86,8 @@ class Application
   private:
 	std::string                      plyPath;
 	Scene                            scene;
-	uint32_t                         splatCount = 0;
+	uint32_t                         splatCount  = 0;
+	uint32_t                         paddedCount = 0;        // splatCount rounded up to a power of two (bitonic sort)
 	Camera                           camera;
 
 	GLFWwindow                      *window = nullptr;
@@ -90,16 +109,30 @@ class Application
 	vk::raii::PipelineLayout      pipelineLayout      = nullptr;
 	vk::raii::Pipeline            graphicsPipeline    = nullptr;
 
+	// Compute sort: one set-0 layout shared by both pipelines (init + bitonic pass).
+	SortMode                             sortMode                   = SortMode::Cpu;
+	vk::raii::DescriptorSetLayout        computeDescriptorSetLayout = nullptr;
+	vk::raii::PipelineLayout             computePipelineLayout      = nullptr;
+	vk::raii::Pipeline                   sortInitPipeline           = nullptr;
+	vk::raii::Pipeline                   sortBitonicPipeline        = nullptr;
+	glm::vec4                            viewRow2{0.0f};        // this frame's view 3rd row, pushed to the sort
+	// computeDescriptorSets is declared after descriptorPool below so it destructs first.
+
 	// All splats live in one device-local storage buffer, uploaded once.
 	vk::raii::Buffer       splatBuffer       = nullptr;
 	vk::raii::DeviceMemory splatBufferMemory = nullptr;
 
 	// Per-frame, host-visible, persistently-mapped sorted-index buffers (back-to-front order).
+	// Also serve as the bitonic sort's in-place "values" buffer in GPU mode.
 	std::vector<vk::raii::Buffer>       indexBuffers;
 	std::vector<vk::raii::DeviceMemory> indexBuffersMemory;
 	std::vector<void *>                 indexBuffersMapped;
 	std::vector<uint32_t>               sortedIndices;        // CPU scratch reused each frame
 	std::vector<float>                  splatDepths;          // CPU scratch reused each frame
+
+	// Per-frame device-local key buffers (compute-only scratch for the bitonic sort).
+	std::vector<vk::raii::Buffer>       sortKeyBuffers;
+	std::vector<vk::raii::DeviceMemory> sortKeyBuffersMemory;
 
 	std::vector<vk::raii::Buffer>       uniformBuffers;
 	std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
@@ -107,6 +140,7 @@ class Application
 
 	vk::raii::DescriptorPool             descriptorPool = nullptr;
 	std::vector<vk::raii::DescriptorSet> descriptorSets;
+	std::vector<vk::raii::DescriptorSet> computeDescriptorSets;        // freed before descriptorPool (declared after it)
 
 	vk::raii::CommandPool                commandPool = nullptr;
 	std::vector<vk::raii::CommandBuffer> commandBuffers;
@@ -145,6 +179,9 @@ class Application
 		if (splatCount == 0)
 			throw std::runtime_error("ply contained no splats: " + plyPath);
 		std::cout << "loaded " << splatCount << " splats from " << plyPath << std::endl;
+
+		// Bitonic sort needs a power-of-two element count; padding slots sort to the end.
+		paddedCount = std::max<uint32_t>(2u, std::bit_ceil(splatCount));
 
 		sortedIndices.resize(splatCount);
 		splatDepths.resize(splatCount);
@@ -205,6 +242,11 @@ class Application
 			glfwSetWindowShouldClose(window, GLFW_TRUE);
 		if (key == GLFW_KEY_F && action == GLFW_PRESS)
 			app->sceneUpFlip = !app->sceneUpFlip;
+		if (key == GLFW_KEY_G && action == GLFW_PRESS)
+		{
+			app->sortMode = (app->sortMode == SortMode::Cpu) ? SortMode::Gpu : SortMode::Cpu;
+			std::cout << "sort: " << (app->sortMode == SortMode::Cpu ? "CPU (std::sort)" : "GPU (bitonic)") << std::endl;
+		}
 	}
 
 	void initVulkan()
@@ -217,13 +259,17 @@ class Application
 		createSwapChain();
 		createImageViews();
 		createDescriptorSetLayout();
+		createComputeDescriptorSetLayout();
 		createGraphicsPipeline();
+		createComputePipelines();
 		createCommandPool();
 		createSplatBuffer();
 		createIndexBuffers();
+		createSortKeyBuffers();
 		createUniformBuffers();
 		createDescriptorPool();
 		createDescriptorSets();
+		createComputeDescriptorSets();
 		createCommandBuffers();
 		createSyncObjects();
 	}
@@ -299,14 +345,12 @@ class Application
 		                                      .engineVersion      = VK_MAKE_VERSION(1, 0, 0),
 		                                      .apiVersion         = vk::ApiVersion14};
 
-		// Get the required layers
 		std::vector<char const *> requiredLayers;
 		if (enableValidationLayers)
 		{
 			requiredLayers.assign(validationLayers.begin(), validationLayers.end());
 		}
 
-		// Check if the required layers are supported by the Vulkan implementation.
 		auto layerProperties    = context.enumerateInstanceLayerProperties();
 		auto unsupportedLayerIt = std::ranges::find_if(requiredLayers,
 		                                               [&layerProperties](auto const &requiredLayer) {
@@ -318,10 +362,8 @@ class Application
 			throw std::runtime_error("Required layer not supported: " + std::string(*unsupportedLayerIt));
 		}
 
-		// Get the required extensions.
 		auto requiredExtensions = getRequiredInstanceExtensions();
 
-		// Check if the required extensions are supported by the Vulkan implementation.
 		auto extensionProperties = context.enumerateInstanceExtensionProperties();
 		auto unsupportedPropertyIt =
 		    std::ranges::find_if(requiredExtensions,
@@ -376,14 +418,14 @@ class Application
 
 	bool isDeviceSuitable(vk::raii::PhysicalDevice const &physicalDevice)
 	{
-		// Check if the physicalDevice supports the Vulkan 1.3 API version
 		bool supportsVulkan1_3 = physicalDevice.getProperties().apiVersion >= VK_API_VERSION_1_3;
 
-		// Check if any of the queue families support graphics operations
+		// The GPU sort dispatches on the render queue, so it must also support compute.
 		auto queueFamilies    = physicalDevice.getQueueFamilyProperties();
-		bool supportsGraphics = std::ranges::any_of(queueFamilies, [](auto const &qfp) { return !!(qfp.queueFlags & vk::QueueFlagBits::eGraphics); });
+		bool supportsGraphics = std::ranges::any_of(queueFamilies, [](auto const &qfp) {
+			return (qfp.queueFlags & vk::QueueFlagBits::eGraphics) && (qfp.queueFlags & vk::QueueFlagBits::eCompute);
+		});
 
-		// Check if all required physicalDevice extensions are available
 		auto availableDeviceExtensions = physicalDevice.enumerateDeviceExtensionProperties();
 		bool supportsAllRequiredExtensions =
 		    std::ranges::all_of(requiredDeviceExtension,
@@ -392,7 +434,6 @@ class Application
 			                                                   [requiredDeviceExtension](auto const &availableDeviceExtension) { return strcmp(availableDeviceExtension.extensionName, requiredDeviceExtension) == 0; });
 		                        });
 
-		// Check if the physicalDevice supports the required features
 		auto features                 = physicalDevice.template getFeatures2<vk::PhysicalDeviceFeatures2,
 		                                                                     vk::PhysicalDeviceVulkan11Features,
 		                                                                     vk::PhysicalDeviceVulkan13Features,
@@ -402,7 +443,6 @@ class Application
 		                                features.template get<vk::PhysicalDeviceVulkan13Features>().synchronization2 &&
 		                                features.template get<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>().extendedDynamicState;
 
-		// Return true if the physicalDevice meets all the criteria
 		return supportsVulkan1_3 && supportsGraphics && supportsAllRequiredExtensions && supportsRequiredFeatures;
 	}
 
@@ -421,23 +461,22 @@ class Application
 	{
 		std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
 
-		// get the first index into queueFamilyProperties which supports both graphics and present
+		// One queue family for graphics, compute and present.
 		for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); qfpIndex++)
 		{
 			if ((queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) &&
+			    (queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eCompute) &&
 			    physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface))
 			{
-				// found a queue family that supports both graphics and present
 				queueIndex = qfpIndex;
 				break;
 			}
 		}
 		if (queueIndex == ~0)
 		{
-			throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
+			throw std::runtime_error("Could not find a queue for graphics, compute and present -> terminating");
 		}
 
-		// query for required features (Vulkan 1.1 and 1.3)
 		vk::StructureChain<vk::PhysicalDeviceFeatures2,
 		                   vk::PhysicalDeviceVulkan11Features,
 		                   vk::PhysicalDeviceVulkan13Features,
@@ -449,9 +488,8 @@ class Application
 		        {.extendedDynamicState = true}                               // vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT
 		    };
 
-		// Assemble the device extensions. The Vulkan spec requires that if a physical device
-		// exposes VK_KHR_portability_subset (as MoltenVK does), it must be enabled.
-		// "VK_KHR_portability_subset" is a beta-gated constant in vulkan.hpp, so use the literal.
+		// A device exposing VK_KHR_portability_subset (MoltenVK) must enable it. The name is a
+		// beta-gated constant in vulkan.hpp, so use the literal.
 		constexpr char const     *portabilitySubsetExtension = "VK_KHR_portability_subset";
 		std::vector<const char *> enabledDeviceExtensions    = requiredDeviceExtension;
 		auto                      availableDeviceExtensions  = physicalDevice.enumerateDeviceExtensionProperties();
@@ -460,7 +498,6 @@ class Application
 			enabledDeviceExtensions.push_back(portabilitySubsetExtension);
 		}
 
-		// create a Device
 		float                     queuePriority = 0.5f;
 		vk::DeviceQueueCreateInfo deviceQueueCreateInfo{.queueFamilyIndex = queueIndex, .queueCount = 1, .pQueuePriorities = &queuePriority};
 		vk::DeviceCreateInfo      deviceCreateInfo{.pNext                   = &featureChain.get<vk::PhysicalDeviceFeatures2>(),
@@ -532,6 +569,22 @@ class Application
 		descriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
 	}
 
+	void createComputeDescriptorSetLayout()
+	{
+		std::array bindings{
+		    // binding 0: splat data (read) — positions for depth keys
+		    vk::DescriptorSetLayoutBinding{
+		        .binding = 0, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+		    // binding 1: sort keys (read/write scratch)
+		    vk::DescriptorSetLayoutBinding{
+		        .binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+		    // binding 2: sort values == draw indices (read/write, sorted in place)
+		    vk::DescriptorSetLayoutBinding{
+		        .binding = 2, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute}};
+		vk::DescriptorSetLayoutCreateInfo layoutInfo{.bindingCount = static_cast<uint32_t>(bindings.size()), .pBindings = bindings.data()};
+		computeDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
+	}
+
 	void createGraphicsPipeline()
 	{
 		vk::raii::ShaderModule shaderModule = createShaderModule(readFile("shaders/slang.spv"));
@@ -594,6 +647,24 @@ class Application
 		graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
 	}
 
+	void createComputePipelines()
+	{
+		vk::raii::ShaderModule shaderModule = createShaderModule(readFile("shaders/compute.spv"));
+
+		vk::PushConstantRange pushRange{.stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = sizeof(SortPushConstants)};
+		vk::PipelineLayoutCreateInfo layoutInfo{
+		    .setLayoutCount = 1, .pSetLayouts = &*computeDescriptorSetLayout, .pushConstantRangeCount = 1, .pPushConstantRanges = &pushRange};
+		computePipelineLayout = vk::raii::PipelineLayout(device, layoutInfo);
+
+		auto makePipeline = [&](const char *entry) {
+			vk::PipelineShaderStageCreateInfo stage{.stage = vk::ShaderStageFlagBits::eCompute, .module = shaderModule, .pName = entry};
+			vk::ComputePipelineCreateInfo     info{.stage = stage, .layout = computePipelineLayout};
+			return vk::raii::Pipeline(device, nullptr, info);
+		};
+		sortInitPipeline    = makePipeline("sortInitMain");
+		sortBitonicPipeline = makePipeline("sortBitonicMain");
+	}
+
 	void createCommandPool()
 	{
 		vk::CommandPoolCreateInfo poolInfo{.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -631,9 +702,9 @@ class Application
 
 	void createIndexBuffers()
 	{
-		// One host-visible, persistently-mapped index buffer per frame in flight. The
-		// per-frame sort writes back-to-front splat order here before rendering.
-		vk::DeviceSize bufferSize = sizeof(uint32_t) * splatCount;
+		// Host-visible, persistently-mapped, one per frame. The CPU sort memcpy's order here; the
+		// GPU sort writes it in place as its "values" buffer. Sized to paddedCount for padding.
+		vk::DeviceSize bufferSize = sizeof(uint32_t) * paddedCount;
 		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		{
 			auto [buffer, bufferMem] = createBuffer(
@@ -641,6 +712,19 @@ class Application
 			indexBuffers.emplace_back(std::move(buffer));
 			indexBuffersMemory.emplace_back(std::move(bufferMem));
 			indexBuffersMapped.emplace_back(indexBuffersMemory.back().mapMemory(0, bufferSize));
+		}
+	}
+
+	void createSortKeyBuffers()
+	{
+		// Per-frame device-local scratch holding the bitonic sort's depth keys.
+		vk::DeviceSize bufferSize = sizeof(uint32_t) * paddedCount;
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			auto [buffer, bufferMem] =
+			    createBuffer(bufferSize, vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal);
+			sortKeyBuffers.emplace_back(std::move(buffer));
+			sortKeyBuffersMemory.emplace_back(std::move(bufferMem));
 		}
 	}
 
@@ -661,9 +745,10 @@ class Application
 	{
 		std::array poolSizes{
 		    vk::DescriptorPoolSize{.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = MAX_FRAMES_IN_FLIGHT},
-		    vk::DescriptorPoolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 2 * MAX_FRAMES_IN_FLIGHT}};        // splat + index per frame
+		    // graphics: splat + index per frame (2); compute: splat + keys + values per frame (3)
+		    vk::DescriptorPoolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 5 * MAX_FRAMES_IN_FLIGHT}};
 		vk::DescriptorPoolCreateInfo poolInfo{.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-		                                      .maxSets       = MAX_FRAMES_IN_FLIGHT,
+		                                      .maxSets       = 2 * MAX_FRAMES_IN_FLIGHT,        // graphics set + compute set per frame
 		                                      .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
 		                                      .pPoolSizes    = poolSizes.data()};
 		descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
@@ -688,6 +773,29 @@ class Application
 			    vk::WriteDescriptorSet{.dstSet = descriptorSets[i], .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eUniformBuffer, .pBufferInfo = &uboInfo},
 			    vk::WriteDescriptorSet{.dstSet = descriptorSets[i], .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &splatInfo},
 			    vk::WriteDescriptorSet{.dstSet = descriptorSets[i], .dstBinding = 2, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &indexInfo}};
+			device.updateDescriptorSets(descriptorWrites, {});
+		}
+	}
+
+	void createComputeDescriptorSets()
+	{
+		std::vector<vk::DescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, *computeDescriptorSetLayout);
+		vk::DescriptorSetAllocateInfo        allocInfo{.descriptorPool     = descriptorPool,
+		                                               .descriptorSetCount = static_cast<uint32_t>(layouts.size()),
+		                                               .pSetLayouts        = layouts.data()};
+
+		computeDescriptorSets = device.allocateDescriptorSets(allocInfo);
+
+		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			vk::DescriptorBufferInfo splatInfo{.buffer = splatBuffer, .offset = 0, .range = sizeof(GpuSplat) * splatCount};
+			vk::DescriptorBufferInfo keyInfo{.buffer = sortKeyBuffers[i], .offset = 0, .range = sizeof(uint32_t) * paddedCount};
+			vk::DescriptorBufferInfo valueInfo{.buffer = indexBuffers[i], .offset = 0, .range = sizeof(uint32_t) * paddedCount};
+
+			std::array descriptorWrites{
+			    vk::WriteDescriptorSet{.dstSet = computeDescriptorSets[i], .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &splatInfo},
+			    vk::WriteDescriptorSet{.dstSet = computeDescriptorSets[i], .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &keyInfo},
+			    vk::WriteDescriptorSet{.dstSet = computeDescriptorSets[i], .dstBinding = 2, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &valueInfo}};
 			device.updateDescriptorSets(descriptorWrites, {});
 		}
 	}
@@ -725,12 +833,61 @@ class Application
 		commandBuffers = vk::raii::CommandBuffers(device, allocInfo);
 	}
 
+	// Record the GPU bitonic sort, leaving back-to-front draw indices in indexBuffers[frameIndex].
+	void recordSort()
+	{
+		auto &commandBuffer = commandBuffers[frameIndex];
+
+		SortPushConstants pc{.viewRow2 = viewRow2, .splatCount = splatCount, .paddedCount = paddedCount, .j = 0, .k = 0};
+
+		// Serializes dependent dispatches (write -> read/write).
+		const vk::MemoryBarrier2 computeBarrier{
+		    .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+		    .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+		    .dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+		    .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite};
+		const vk::DependencyInfo computeDependency{.memoryBarrierCount = 1, .pMemoryBarriers = &computeBarrier};
+
+		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, computePipelineLayout, 0, *computeDescriptorSets[frameIndex], nullptr);
+
+		// 1) Fill keys (order-preserving depth) and identity values for every padded slot.
+		commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *sortInitPipeline);
+		commandBuffer.pushConstants<SortPushConstants>(computePipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
+		uint32_t groups = (paddedCount + 255u) / 256u;
+		commandBuffer.dispatch(groups, 1, 1);
+		commandBuffer.pipelineBarrier2(computeDependency);
+
+		// 2) Bitonic network: one dispatch per (k, j) stage, in place on keys + values.
+		commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *sortBitonicPipeline);
+		for (uint32_t k = 2; k <= paddedCount; k <<= 1)
+		{
+			for (uint32_t j = k >> 1; j > 0; j >>= 1)
+			{
+				pc.k = k;
+				pc.j = j;
+				commandBuffer.pushConstants<SortPushConstants>(computePipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
+				commandBuffer.dispatch(groups, 1, 1);
+				commandBuffer.pipelineBarrier2(computeDependency);
+			}
+		}
+
+		// 3) Hand the sorted indices to the vertex stage.
+		const vk::MemoryBarrier2 toVertexBarrier{
+		    .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
+		    .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+		    .dstStageMask  = vk::PipelineStageFlagBits2::eVertexShader,
+		    .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead};
+		commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toVertexBarrier});
+	}
+
 	void recordCommandBuffer(uint32_t imageIndex)
 	{
 		auto &commandBuffer = commandBuffers[frameIndex];
 		commandBuffer.begin({});
 
-		// Before starting rendering, transition the swapchain image to vk::ImageLayout::eColorAttachmentOptimal
+		if (sortMode == SortMode::Gpu)
+			recordSort();
+
 		transition_image_layout(
 		    imageIndex,
 		    vk::ImageLayout::eUndefined,
@@ -761,7 +918,6 @@ class Application
 		commandBuffer.draw(4, splatCount, 0, 0);
 		commandBuffer.endRendering();
 
-		// After rendering, transition the swapchain image to vk::ImageLayout::ePresentSrcKHR
 		transition_image_layout(
 		    imageIndex,
 		    vk::ImageLayout::eColorAttachmentOptimal,
@@ -842,17 +998,22 @@ class Application
 		memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
 	}
 
-	// Sort splats back-to-front by camera-space depth and upload the order for this frame.
-	void sortSplats()
+	// The view matrix 3rd row: camera-space z = dot(row2.xyz, pos) + row2.w. With -Z forward,
+	// more-negative z is farther away, so ascending z is back-to-front order for "over" blending.
+	// Shared by both sort paths (CPU below, GPU push constants) so their keys match exactly.
+	void updateViewRow2()
 	{
 		glm::mat4 view = currentViewMatrix();
-		// Depth = camera-space z. With -Z forward, more-negative z is farther away, so we
-		// sort ascending in z (far first) to get back-to-front order for "over" blending.
-		const glm::vec4 row2 = glm::vec4(view[0][2], view[1][2], view[2][2], view[3][2]);
+		viewRow2       = glm::vec4(view[0][2], view[1][2], view[2][2], view[3][2]);
+	}
+
+	// CPU path: sort splats back-to-front by camera-space depth and upload the order.
+	void sortSplats()
+	{
 		for (uint32_t i = 0; i < splatCount; ++i)
 		{
 			const glm::vec3 &p = scene.splats[i].position;
-			splatDepths[i]     = row2.x * p.x + row2.y * p.y + row2.z * p.z + row2.w;
+			splatDepths[i]     = viewRow2.x * p.x + viewRow2.y * p.y + viewRow2.z * p.z + viewRow2.w;
 			sortedIndices[i]   = i;
 		}
 		std::ranges::sort(sortedIndices, [this](uint32_t a, uint32_t b) { return splatDepths[a] < splatDepths[b]; });
@@ -872,22 +1033,23 @@ class Application
 
 		auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
 
-		// Due to VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS being defined, eErrorOutOfDateKHR can be checked as a result
-		// here and does not need to be caught by an exception.
+		// VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS lets eErrorOutOfDateKHR return here
+		// instead of throwing.
 		if (result == vk::Result::eErrorOutOfDateKHR)
 		{
 			recreateSwapChain();
 			return;
 		}
-		// On other success codes than eSuccess and eSuboptimalKHR we just throw an exception.
-		// On any error code, aquireNextImage already threw an exception.
 		if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR)
 		{
 			assert(result == vk::Result::eTimeout || result == vk::Result::eNotReady);
 			throw std::runtime_error("failed to acquire swap chain image!");
 		}
 		updateUniformBuffer(frameIndex);
-		sortSplats();
+		updateViewRow2();
+		if (sortMode == SortMode::Cpu)
+			sortSplats();
+		// GPU mode sorts inside the command buffer (recordSort), using viewRow2 as push constants.
 
 		// Only reset the fence if we are submitting work
 		device.resetFences(*inFlightFences[frameIndex]);
@@ -911,8 +1073,6 @@ class Application
 		                                        .pSwapchains        = &*swapChain,
 		                                        .pImageIndices      = &imageIndex};
 		result = queue.presentKHR(presentInfoKHR);
-		// Due to VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS being defined, eErrorOutOfDateKHR can be checked as a result
-		// here and does not need to be caught by an exception.
 		if ((result == vk::Result::eSuboptimalKHR) || (result == vk::Result::eErrorOutOfDateKHR) || framebufferResized)
 		{
 			framebufferResized = false;
@@ -920,7 +1080,6 @@ class Application
 		}
 		else
 		{
-			// There are no other success codes than eSuccess; on any error code, presentKHR already threw an exception.
 			assert(result == vk::Result::eSuccess);
 		}
 		frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;

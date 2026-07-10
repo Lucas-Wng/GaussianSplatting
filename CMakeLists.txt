@@ -89,12 +89,14 @@ if(WIN32)
   endif()
 endif()
 
-# Slang shader
+# Slang shaders
 set (SHADER_TARGET ${TEMPLATE_NAME}Shader)
 set (SHADERS_DIR ${TEMPLATE_DIR}/shaders)
+add_custom_command(OUTPUT ${SHADERS_DIR} COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR})
+
+# Graphics pipeline: EWA splat vertex + fragment shaders.
 set (SHADER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader.slang")
 set (ENTRY_POINTS -entry vertMain -entry fragMain)
-add_custom_command(OUTPUT ${SHADERS_DIR} COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR})
 add_custom_command(
   OUTPUT  ${SHADERS_DIR}/slang.spv
   COMMAND ${SLANGC_EXECUTABLE} ${SHADER_SOURCES} -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name ${ENTRY_POINTS} -o ${TEMPLATE_DIR}/shaders/slang.spv
@@ -103,7 +105,20 @@ add_custom_command(
   COMMENT "Compiling Slang Shaders"
   VERBATIM
 )
-add_custom_target(${SHADER_TARGET} DEPENDS ${SHADERS_DIR}/slang.spv)
+
+# Compute pipeline: GPU bitonic depth sort.
+set (COMPUTE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/compute.slang")
+set (COMPUTE_ENTRY_POINTS -entry sortInitMain -entry sortBitonicMain)
+add_custom_command(
+  OUTPUT  ${SHADERS_DIR}/compute.spv
+  COMMAND ${SLANGC_EXECUTABLE} ${COMPUTE_SOURCES} -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name ${COMPUTE_ENTRY_POINTS} -o ${TEMPLATE_DIR}/shaders/compute.spv
+  WORKING_DIRECTORY ${SHADERS_DIR}
+  DEPENDS ${SHADERS_DIR} ${COMPUTE_SOURCES}
+  COMMENT "Compiling Slang Compute Shaders"
+  VERBATIM
+)
+
+add_custom_target(${SHADER_TARGET} DEPENDS ${SHADERS_DIR}/slang.spv ${SHADERS_DIR}/compute.spv)
 add_dependencies(${TEMPLATE_NAME} ${SHADER_TARGET})
 
 # Bundle every .ply in assets/ into the run directory's models/ folder
