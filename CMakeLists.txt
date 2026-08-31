@@ -118,7 +118,19 @@ add_custom_command(
   VERBATIM
 )
 
-add_custom_target(${SHADER_TARGET} DEPENDS ${SHADERS_DIR}/slang.spv ${SHADERS_DIR}/compute.spv)
+# Compute pipeline: LSD radix sort + exclusive scan.
+set (RADIX_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shaders/radix.slang")
+set (RADIX_ENTRY_POINTS -entry radixHistogramMain -entry radixScatterMain -entry scanBlockMain -entry scanAddMain -entry radixDepthInitMain)
+add_custom_command(
+  OUTPUT  ${SHADERS_DIR}/radix.spv
+  COMMAND ${SLANGC_EXECUTABLE} ${RADIX_SOURCES} -target spirv -profile spirv_1_4 -emit-spirv-directly -fvk-use-entrypoint-name ${RADIX_ENTRY_POINTS} -o ${TEMPLATE_DIR}/shaders/radix.spv
+  WORKING_DIRECTORY ${SHADERS_DIR}
+  DEPENDS ${SHADERS_DIR} ${RADIX_SOURCES}
+  COMMENT "Compiling Slang Radix Shaders"
+  VERBATIM
+)
+
+add_custom_target(${SHADER_TARGET} DEPENDS ${SHADERS_DIR}/slang.spv ${SHADERS_DIR}/compute.spv ${SHADERS_DIR}/radix.spv)
 add_dependencies(${TEMPLATE_NAME} ${SHADER_TARGET})
 
 # Bundle every .ply in assets/ into the run directory's models/ folder
