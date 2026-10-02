@@ -138,3 +138,9 @@ file (GLOB SCENE_PLYS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/*.pl
 if (SCENE_PLYS)
   file (COPY ${SCENE_PLYS} DESTINATION ${TEMPLATE_DIR}/models)
 endif()
+
+# Headless GPU radix-sort correctness check (see src/main.cpp's runRadixSelfTest). Needs a
+# windowing/display surface to pick a device, so a Linux CI runner drives it under xvfb-run.
+enable_testing()
+add_test(NAME RadixSelfTest COMMAND ${TEMPLATE_NAME} --self-test)
+set_tests_properties(RadixSelfTest PROPERTIES WORKING_DIRECTORY ${TEMPLATE_DIR})

@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Builds and runs the headless GPU radix-sort self-test (see src/main.cpp's
+  # runRadixSelfTest, invoked via `--self-test`) on both macOS (real GPU, via MoltenVK)
+  # and Linux (Mesa's lavapipe software rasterizer, under a virtual display -- there's no
+  # GPU on a standard GitHub-hosted runner).
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: lukka/get-cmake@latest
+
+      - name: Install dependencies
+        run: brew install glfw glm vulkan-headers vulkan-loader molten-vk
+
+      - name: Install slangc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/slang
+          gh release download --repo shader-slang/slang --pattern '*macos-aarch64*.zip' --dir /tmp/slang --clobber
+          mkdir -p /tmp/slang-extracted
+          unzip -q /tmp/slang/*.zip -d /tmp/slang-extracted
+          echo "$(dirname "$(find /tmp/slang-extracted -name slangc | head -1)")" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run radix self-test
+        working-directory: build
+        run: ctest --output-on-failure
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: lukka/get-cmake@latest
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglfw3-dev libglm-dev libvulkan-dev \
+            mesa-vulkan-drivers vulkan-tools xvfb unzip
+
+      - name: Install slangc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/slang
+          gh release download --repo shader-slang/slang --pattern '*linux-x86_64*.tar.gz' --dir /tmp/slang --clobber
+          mkdir -p /tmp/slang-extracted
+          tar -xzf /tmp/slang/*.tar.gz -C /tmp/slang-extracted
+          echo "$(dirname "$(find /tmp/slang-extracted -name slangc | head -1)")" >> "$GITHUB_PATH"
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run radix self-test (lavapipe, under a virtual display)
+        working-directory: build
+        env:
+          # Mesa's software Vulkan ICD -- picks lavapipe since there's no real GPU here.
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: xvfb-run -a ctest --output-on-failure
