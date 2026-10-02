@@ -2,15 +2,20 @@
 #include <array>
 #include <assert.h>
 #include <bit>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 #if defined(__INTELLISENSE__) || !defined(USE_CPP20_MODULES)
@@ -92,15 +97,30 @@ struct RadixPushConstants
 class Application
 {
   public:
-	Application(std::string plyPath, std::filesystem::path resourceDir) :
-	    plyPath(std::move(plyPath)), resourceDir(std::move(resourceDir)) {}
+	Application(std::string plyPath, std::filesystem::path resourceDir, uint32_t benchFramesPerMode, bool selfTestOnly) :
+	    plyPath(std::move(plyPath)), resourceDir(std::move(resourceDir)), benchFramesPerMode(benchFramesPerMode), selfTestOnly(selfTestOnly) {}
+
+	// true on normal exit (or a self-test that passed); false if --self-test failed. Checked
+	// by main() to set the process exit code for CI.
+	bool ok() const { return !selfTestOnly || selfTestPassed; }
 
 	void run()
 	{
 		loadScene();
 		initWindow();
 		initVulkan();
-		mainLoop();
+		if (selfTestOnly)
+		{
+			std::cout << "self-test " << (selfTestPassed ? "PASS" : "FAIL") << std::endl;
+		}
+		else if (benchFramesPerMode > 0)
+		{
+			runBenchmark();
+		}
+		else
+		{
+			mainLoop();
+		}
 		cleanup();
 	}
 
@@ -187,7 +207,12 @@ class Application
 		vk::raii::DescriptorSet              radixInitSet = nullptr;        // splats -> A
 		std::vector<vk::raii::DescriptorSet> scanSets;                      // one per scan level
 	};
-	std::vector<RadixFrame> radixFrames;        // one per frame in flight
+
+	// Must be declared (and so destructed) *before* radixFrames: members destruct in reverse
+	// declaration order, and the sets living in radixFrames[] must be freed back to this pool
+	// while it's still alive, not after.
+	vk::raii::DescriptorPool radixDescriptorPool = nullptr;
+	std::vector<RadixFrame>  radixFrames;        // one per frame in flight
 
 	vk::raii::DescriptorSetLayout radixSetLayout       = nullptr;        // bindings 0-4
 	vk::raii::DescriptorSetLayout scanSetLayout        = nullptr;        // bindings 5-6
@@ -202,7 +227,6 @@ class Application
 	vk::raii::DescriptorSetLayout radixInitSetLayout      = nullptr;
 	vk::raii::PipelineLayout      radixInitPipelineLayout = nullptr;
 	vk::raii::Pipeline            radixInitPipeline       = nullptr;
-	// radixDescriptorPool + its sets are declared after descriptorPool below (destruction order).
 
 	std::vector<vk::raii::Buffer>       uniformBuffers;
 	std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
@@ -211,10 +235,6 @@ class Application
 	vk::raii::DescriptorPool             descriptorPool = nullptr;
 	std::vector<vk::raii::DescriptorSet> descriptorSets;
 	std::vector<vk::raii::DescriptorSet> computeDescriptorSets;        // freed before descriptorPool (declared after it)
-
-	// Radix descriptor pool (sets live in radixFrames[]). Declared after their buffers/layouts
-	// so sets free first.
-	vk::raii::DescriptorPool radixDescriptorPool = nullptr;
 
 	vk::raii::CommandPool                commandPool = nullptr;
 	std::vector<vk::raii::CommandBuffer> commandBuffers;
@@ -232,6 +252,27 @@ class Application
 	double lastMouseY   = 0.0;
 	float  deltaTime    = 0.0f;
 	double lastFrameTime = 0.0;
+
+	// GPU timestamp queries: 3 per frame-in-flight (top-of-pipe, after sort, after draw).
+	static constexpr uint32_t kQueriesPerFrame = 3;
+	vk::raii::QueryPool       timestampQueryPool = nullptr;
+	float                     timestampPeriodNs   = 1.0f;        // ns/tick, from device limits
+	std::array<bool, MAX_FRAMES_IN_FLIGHT> queriesRecorded{};    // guards readback before first use
+
+	// Most recent timing readings, shown in the window title (updated ~4x/second).
+	float  lastGpuSortMs = 0.0f, lastGpuDrawMs = 0.0f, lastCpuSortMs = 0.0f;
+	double titleAccumTime = 0.0;
+	int    titleAccumFrames = 0;
+	double titleLastUpdate  = 0.0;
+
+	// --bench mode: scripted orbit, N frames per sort mode, then print timing and exit.
+	uint32_t                benchFramesPerMode = 0;        // 0 = interactive mode
+	std::vector<SortMode>   benchModes{SortMode::Cpu, SortMode::Gpu, SortMode::Radix};
+
+	// --self-test: run only the headless radix self-test, print PASS/FAIL, and exit (set
+	// via ok() -> main()'s exit code). Useful for CI.
+	bool selfTestOnly  = false;
+	bool selfTestPassed = false;
 
 	// Reconcile COLMAP's Y-down training frame with our Y-up world (toggle with F).
 	// 180 deg about X: negates Y and Z. Pure rotation, so covariances stay correct.
@@ -348,7 +389,9 @@ class Application
 		createRadixResources();
 		createCommandBuffers();
 		createSyncObjects();
-		runRadixSelfTest();        // temporary: validate the radix sort headlessly
+		createQueryPool();
+		if (selfTestOnly)
+			selfTestPassed = runRadixSelfTest();
 	}
 
 	void mainLoop()
@@ -363,9 +406,102 @@ class Application
 			glfwPollEvents();
 			processInput();
 			drawFrame();
+			updateWindowTitle(now);
 		}
 
 		device.waitIdle();
+	}
+
+	// Rolling FPS/frame-time HUD in the window title, refreshed ~4x/second so it's readable
+	// without flickering every frame.
+	void updateWindowTitle(double now)
+	{
+		titleAccumTime += deltaTime;
+		titleAccumFrames += 1;
+		if (now - titleLastUpdate < 0.25 || titleAccumFrames == 0)
+			return;
+		titleLastUpdate = now;
+
+		float       avgMs   = static_cast<float>(titleAccumTime / titleAccumFrames) * 1000.0f;
+		float       fps     = titleAccumFrames / static_cast<float>(titleAccumTime);
+		const char *modeStr = sortMode == SortMode::Cpu ? "CPU" : sortMode == SortMode::Gpu ? "bitonic" : "radix";
+		float       sortMs  = sortMode == SortMode::Cpu ? lastCpuSortMs : lastGpuSortMs;
+
+		char title[256];
+		std::snprintf(title, sizeof(title),
+		              "Gaussian Splatting Viewer - %u splats - %.0f FPS (%.2f ms) - sort[%s] %.3f ms - draw %.3f ms",
+		              splatCount, fps, avgMs, modeStr, sortMs, lastGpuDrawMs);
+		glfwSetWindowTitle(window, title);
+
+		titleAccumTime   = 0.0;
+		titleAccumFrames = 0;
+	}
+
+	// Scripted camera orbit, benchFramesPerMode frames under each SortMode, reusing the same
+	// drawFrame()/recordCommandBuffer() path as interactive rendering (so the numbers reflect
+	// real submission/present overhead, not just an isolated compute dispatch). Prints mean
+	// sort/draw time and p99 total frame time per mode, then exits.
+	void runBenchmark()
+	{
+		struct Sample
+		{
+			float sortMs, drawMs, totalMs;
+		};
+		constexpr uint32_t kWarmupFrames = 10;
+
+		glm::vec3 center  = scene.center();
+		float     radius0 = std::max(scene.radius(), 0.5f);
+
+		std::cout << "\n=== Benchmark: " << splatCount << " splats, " << benchFramesPerMode << " frames/mode (+" << kWarmupFrames << " warmup) ===\n";
+		std::cout << std::left << std::setw(10) << "mode" << std::right
+		          << std::setw(14) << "mean sort(ms)" << std::setw(14) << "mean draw(ms)"
+		          << std::setw(12) << "mean FPS" << std::setw(16) << "p99 total(ms)" << "\n";
+
+		for (SortMode mode : benchModes)
+		{
+			sortMode = mode;
+			std::vector<Sample> samples;
+			samples.reserve(benchFramesPerMode);
+
+			for (uint32_t f = 0; f < kWarmupFrames + benchFramesPerMode; ++f)
+			{
+				// Fixed angular step (not wall-clock-driven), so the bench is reproducible and
+				// not dependent on vsync/present timing.
+				float angle      = static_cast<float>(f) * 0.02f;
+				camera.position  = center + glm::vec3(std::cos(angle), 0.3f, std::sin(angle)) * radius0 * 2.5f;
+				camera.yaw       = angle + glm::pi<float>();        // roughly face the scene center
+				camera.pitch     = -0.2f;
+
+				glfwPollEvents();
+				drawFrame();
+
+				if (f >= kWarmupFrames)
+				{
+					float sortMs = (mode == SortMode::Cpu) ? lastCpuSortMs : lastGpuSortMs;
+					samples.push_back({sortMs, lastGpuDrawMs, sortMs + lastGpuDrawMs});
+				}
+			}
+			device.waitIdle();
+
+			std::ranges::sort(samples, std::less<>{}, &Sample::totalMs);
+			auto mean = [&](float Sample::*field) {
+				double sum = 0.0;
+				for (const Sample &s : samples)
+					sum += s.*field;
+				return static_cast<float>(sum / samples.size());
+			};
+			float meanSort  = mean(&Sample::sortMs);
+			float meanDraw  = mean(&Sample::drawMs);
+			float meanTotal = mean(&Sample::totalMs);
+			float p99Total  = samples[static_cast<size_t>(samples.size() * 0.99)].totalMs;
+
+			const char *name = mode == SortMode::Cpu ? "cpu" : mode == SortMode::Gpu ? "bitonic" : "radix";
+			std::cout << std::left << std::setw(10) << name << std::right
+			          << std::setw(14) << meanSort << std::setw(14) << meanDraw
+			          << std::setw(12) << (1000.0f / meanTotal) << std::setw(16) << p99Total << "\n";
+		}
+
+		glfwSetWindowShouldClose(window, GLFW_TRUE);
 	}
 
 	void processInput()
@@ -1141,7 +1277,8 @@ class Application
 	}
 
 	// Headless correctness check: sort random 64-bit keys on the GPU and compare to std::sort.
-	void runRadixSelfTest()
+	// Returns true on success; run unconditionally with --self-test (see main()), or on demand.
+	bool runRadixSelfTest()
 	{
 		RadixFrame           &rf = radixFrames[0];
 		uint32_t              n  = radixCapacity;
@@ -1191,6 +1328,7 @@ class Application
 		// Re-seed the depth-init descriptor writes; the self-test clobbered rf's A buffers with
 		// arbitrary test data, but the descriptor bindings themselves are untouched, so nothing
 		// further is required here — recordRadixSort's init pass overwrites A unconditionally.
+		return ok;
 	}
 
 	uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties)
@@ -1309,10 +1447,18 @@ class Application
 		auto &commandBuffer = commandBuffers[frameIndex];
 		commandBuffer.begin({});
 
+		uint32_t qBase = frameIndex * kQueriesPerFrame;
+		commandBuffer.resetQueryPool(timestampQueryPool, qBase, kQueriesPerFrame);
+		commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, timestampQueryPool, qBase + 0);
+
 		if (sortMode == SortMode::Gpu)
 			recordSort();
 		else if (sortMode == SortMode::Radix)
 			recordRadixSort();
+
+		// eBottomOfPipe so this only fires once all prior work (the sort, if any) has actually
+		// finished -- eTopOfPipe would fire as soon as the command is dispatched, before that.
+		commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, timestampQueryPool, qBase + 1);
 
 		transition_image_layout(
 		    imageIndex,
@@ -1343,6 +1489,9 @@ class Application
 		// One instanced quad (4-vert triangle strip) per splat.
 		commandBuffer.draw(4, splatCount, 0, 0);
 		commandBuffer.endRendering();
+
+		commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, timestampQueryPool, qBase + 2);
+		queriesRecorded[frameIndex] = true;
 
 		transition_image_layout(
 		    imageIndex,
@@ -1404,6 +1553,30 @@ class Application
 		}
 	}
 
+	void createQueryPool()
+	{
+		vk::QueryPoolCreateInfo info{.queryType = vk::QueryType::eTimestamp, .queryCount = kQueriesPerFrame * MAX_FRAMES_IN_FLIGHT};
+		timestampQueryPool = vk::raii::QueryPool(device, info);
+		timestampPeriodNs  = physicalDevice.getProperties().limits.timestampPeriod;
+	}
+
+	// Read back the previous use of this frame slot's GPU timestamps (query 0/1/2 = top of
+	// pipe / after sort / after draw). Safe to call without waiting: the caller has already
+	// waited on this slot's fence, so the GPU work that wrote them is complete.
+	void readTimestamps(uint32_t slot)
+	{
+		if (!queriesRecorded[slot])
+			return;
+		std::array<uint64_t, kQueriesPerFrame> ts{};
+		vk::Result result = static_cast<vk::Result>(vkGetQueryPoolResults(
+		    *device, *timestampQueryPool, slot * kQueriesPerFrame, kQueriesPerFrame,
+		    sizeof(ts), ts.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT));
+		if (result != vk::Result::eSuccess)
+			return;        // eNotReady or a transient error; keep showing the last good reading
+		lastGpuSortMs = static_cast<float>(ts[1] - ts[0]) * timestampPeriodNs * 1e-6f;
+		lastGpuDrawMs = static_cast<float>(ts[2] - ts[1]) * timestampPeriodNs * 1e-6f;
+	}
+
 	static constexpr float kFovY = glm::radians(60.0f);
 
 	void updateUniformBuffer(uint32_t currentImage)
@@ -1461,6 +1634,9 @@ class Application
 		{
 			throw std::runtime_error("failed to wait for fence!");
 		}
+		// This slot's prior GPU work (if any) is now guaranteed complete, so its timestamp
+		// queries are ready to read.
+		readTimestamps(frameIndex);
 
 		auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
 
@@ -1479,7 +1655,11 @@ class Application
 		updateUniformBuffer(frameIndex);
 		updateViewRow2();
 		if (sortMode == SortMode::Cpu)
+		{
+			auto t0 = std::chrono::steady_clock::now();
 			sortSplats();
+			lastCpuSortMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		}
 		// GPU mode sorts inside the command buffer (recordSort), using viewRow2 as push constants.
 
 		// Only reset the fence if we are submitting work
@@ -1617,13 +1797,34 @@ int main(int argc, char **argv)
 	// current working directory, so the app runs correctly regardless of launch cwd.
 	std::filesystem::path resourceDir = std::filesystem::absolute(argv[0]).parent_path();
 
+	// --bench[=N] runs a scripted camera orbit for N frames (default 300) under each sort
+	// mode, prints per-stage GPU timing, and exits -- see Application::runBenchmark().
+	// --self-test runs only the headless radix correctness check and exits (PASS/FAIL ->
+	// process exit code); useful for CI, where it previously ran unconditionally on every
+	// launch instead.
+	uint32_t    benchFramesPerMode = 0;
+	bool        selfTestOnly       = false;
+	std::string plyArg;
+	for (int i = 1; i < argc; ++i)
+	{
+		std::string_view arg = argv[i];
+		if (arg == "--bench")
+			benchFramesPerMode = 300;
+		else if (arg.rfind("--bench=", 0) == 0)
+			benchFramesPerMode = static_cast<uint32_t>(std::stoul(std::string(arg.substr(8))));
+		else if (arg == "--self-test")
+			selfTestOnly = true;
+		else
+			plyArg = argv[i];
+	}
+
 	// Path to a pretrained 3DGS .ply; defaults to the bundled cactus scene. A user-supplied
 	// path is tried as given (absolute, or relative to cwd) and, failing that, relative to
 	// the executable's directory (so "models/foo.ply" works from any cwd too).
 	std::string plyPath;
-	if (argc > 1)
+	if (!plyArg.empty())
 	{
-		std::filesystem::path candidate(argv[1]);
+		std::filesystem::path candidate(plyArg);
 		plyPath = std::filesystem::exists(candidate) ? candidate.string() : (resourceDir / candidate).string();
 	}
 	else
@@ -1633,8 +1834,10 @@ int main(int argc, char **argv)
 
 	try
 	{
-		Application app(plyPath, resourceDir);
+		Application app(plyPath, resourceDir, benchFramesPerMode, selfTestOnly);
 		app.run();
+		if (!app.ok())
+			return EXIT_FAILURE;
 	}
 	catch (const std::exception &e)
 	{
