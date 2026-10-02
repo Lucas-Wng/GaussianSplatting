@@ -2,6 +2,7 @@
 
 #include <glm/gtc/quaternion.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -68,9 +69,12 @@ namespace
 	}
 
 	// Build a GpuSplat from activated inputs: world position, world-space scale (already
-	// exp'd), a rotation quaternion, final linear RGB, and final opacity (0..1).
+	// exp'd), a rotation quaternion, the raw (unactivated) SH band-0 color, the raw SH
+	// bands 1-3 coefficients (shRest, channel-major RGB per coefficient), and final
+	// opacity (0..1). SH evaluation is view-dependent, so the +0.5 offset/clamp that turns
+	// these into a displayable color happens per-frame in the vertex shader, not here.
 	GpuSplat buildSplat(const glm::vec3 &pos, const glm::vec3 &scale, glm::quat q,
-	                    const glm::vec3 &rgb, float opacity)
+	                    const glm::vec3 &dc, const std::array<glm::vec3, kShRestCoeffs> &shRest, float opacity)
 	{
 		q = glm::normalize(q);
 		glm::mat3 R     = glm::mat3_cast(q);
@@ -80,9 +84,11 @@ namespace
 		GpuSplat s;
 		s.position = pos;
 		s.opacity  = opacity;
-		s.color    = glm::vec4(rgb, 1.0f);
+		s.color    = glm::vec4(SH_C0 * dc, 0.0f);
 		s.cov_a    = glm::vec4(sigma[0][0], sigma[0][1], sigma[0][2], sigma[1][1]);
 		s.cov_b    = glm::vec4(sigma[1][2], sigma[2][2], 0.0f, 0.0f);
+		for (int i = 0; i < kShRestCoeffs; ++i)
+			s.shRest[i] = glm::vec4(shRest[i], 0.0f);
 		return s;
 	}
 
@@ -101,6 +107,20 @@ namespace
 		const Property &s0 = req("scale_0"), &s1 = req("scale_1"), &s2 = req("scale_2");
 		const Property &r0 = req("rot_0"), &r1 = req("rot_1"), &r2 = req("rot_2"), &r3 = req("rot_3");
 
+		// f_rest_0.. (higher-order SH, bands 1-3) is optional and channel-major: all 15
+		// coefficients for R, then 15 for G, then 15 for B (mirrors f_dc_0..2 = R,G,B). A ply
+		// exported at a lower SH degree has fewer than 45; anything missing defaults to 0.
+		std::array<const Property *, 3 * kShRestCoeffs> restProps{};
+		int                                              numRest = 0;
+		for (int i = 0; i < 3 * kShRestCoeffs; ++i)
+		{
+			auto it = v.byName.find("f_rest_" + std::to_string(i));
+			if (it == v.byName.end())
+				break;
+			restProps[i] = &it->second;
+			numRest      = i + 1;
+		}
+
 		out.reserve(v.count);
 		for (size_t i = 0; i < v.count; ++i)
 		{
@@ -108,8 +128,18 @@ namespace
 			glm::vec3      pos{readFloat(rec, px), readFloat(rec, py), readFloat(rec, pz)};
 			glm::vec3      scale{std::exp(readFloat(rec, s0)), std::exp(readFloat(rec, s1)), std::exp(readFloat(rec, s2))};
 			glm::quat      q{readFloat(rec, r0), readFloat(rec, r1), readFloat(rec, r2), readFloat(rec, r3)};        // (w,x,y,z)
-			glm::vec3      rgb{0.5f + SH_C0 * readFloat(rec, c0), 0.5f + SH_C0 * readFloat(rec, c1), 0.5f + SH_C0 * readFloat(rec, c2)};
-			out.push_back(buildSplat(pos, scale, q, rgb, sigmoid(readFloat(rec, op))));
+			glm::vec3      dc{readFloat(rec, c0), readFloat(rec, c1), readFloat(rec, c2)};
+
+			std::array<glm::vec3, kShRestCoeffs> shRest{};
+			for (int c = 0; c < kShRestCoeffs; ++c)
+			{
+				float r         = (c < numRest) ? readFloat(rec, *restProps[c]) : 0.0f;
+				float g         = (kShRestCoeffs + c < numRest) ? readFloat(rec, *restProps[kShRestCoeffs + c]) : 0.0f;
+				float b         = (2 * kShRestCoeffs + c < numRest) ? readFloat(rec, *restProps[2 * kShRestCoeffs + c]) : 0.0f;
+				shRest[c]       = glm::vec3(r, g, b);
+			}
+
+			out.push_back(buildSplat(pos, scale, q, dc, shRest, sigmoid(readFloat(rec, op))));
 		}
 	}
 }        // namespace

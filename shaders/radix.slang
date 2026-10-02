@@ -131,7 +131,8 @@ void scanAddMain(uint3 gid : SV_GroupID, uint3 dtid : SV_DispatchThreadID)
 
 // --- Depth-key init: seeds keyBufferA/valBufferA from splat positions (own set/layout). ---
 
-// Must match GpuSplat in src/ply_loader.hpp.
+// Must match GpuSplat in src/ply_loader.hpp (only `position` is read here, but the struct's
+// total size must still match so indexing into the shared splat buffer stays aligned).
 struct Splat
 {
     float3 position;
@@ -139,6 +140,7 @@ struct Splat
     float4 color;
     float4 cov_a;
     float4 cov_b;
+    float4 shRest[15];
 };
 
 struct RadixInitPush

@@ -52,6 +52,7 @@ struct UniformBufferObject
 	glm::mat4 proj;
 	glm::vec2 viewport;        // framebuffer size in pixels
 	glm::vec2 focal;           // fx, fy in pixels
+	glm::vec4 campos;          // xyz = camera position in scene space (matches splat positions)
 };
 
 // Selects the back-to-front sort strategy; toggle at runtime with G.
@@ -1412,6 +1413,11 @@ class Application
 		float fy       = height / (2.0f * std::tan(kFovY * 0.5f));
 		ubo.viewport   = glm::vec2(width, height);
 		ubo.focal      = glm::vec2(fy, fy);
+
+		// SH evaluation needs the camera position in the same (scene) space as splat
+		// positions. kSceneUpCorrection is diagonal and involutory, so it is its own inverse.
+		glm::vec3 camPosScene = sceneUpFlip ? glm::vec3(kSceneUpCorrection * glm::vec4(camera.position, 1.0f)) : camera.position;
+		ubo.campos            = glm::vec4(camPosScene, 0.0f);
 
 		memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
 	}
