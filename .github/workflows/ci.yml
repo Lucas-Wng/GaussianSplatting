@@ -6,10 +6,14 @@ on:
   pull_request:
 
 jobs:
-  # Builds and runs the headless GPU radix-sort self-test (see src/main.cpp's
-  # runRadixSelfTest, invoked via `--self-test`) on both macOS (real GPU, via MoltenVK)
-  # and Linux (Mesa's lavapipe software rasterizer, under a virtual display -- there's no
-  # GPU on a standard GitHub-hosted runner).
+  # macOS: build-only. GitHub's hosted macOS runners are VMs behind a paravirtualized GPU
+  # ("AppleParavirtDevice"), not real Metal hardware passthrough, and MoltenVK crashes
+  # against it during physical-device init (NSInvalidArgumentException from
+  # newArgumentEncoderWithLayout:, confirmed in practice) -- that's an environment
+  # limitation of the runner, not something fixable here. Still valuable: it catches
+  # compile/portability issues against a real Apple toolchain and SDK headers (this is how
+  # a latent C++20-parenthesized-aggregate-init incompatibility with macos-14's stock Xcode
+  # was actually found). The real GPU correctness check runs on Linux below, via lavapipe.
   macos:
     runs-on: macos-14
     steps:
@@ -39,10 +43,6 @@ jobs:
 
       - name: Build
         run: cmake --build build --config Release
-
-      - name: Run radix self-test
-        working-directory: build
-        run: ctest --output-on-failure
 
   linux:
     runs-on: ubuntu-latest
@@ -85,9 +85,15 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Show available Vulkan ICDs (debugging aid)
+        run: |
+          ls -la /usr/share/vulkan/icd.d/ 2>&1 || true
+          xvfb-run -a vulkaninfo --summary 2>&1 || true
+
       - name: Run radix self-test (lavapipe, under a virtual display)
         working-directory: build
-        env:
-          # Mesa's software Vulkan ICD -- picks lavapipe since there's no real GPU here.
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        # No VK_ICD_FILENAMES override: setting it to a guessed path once caused
+        # ErrorIncompatibleDriver (it disables the loader's normal ICD auto-discovery
+        # entirely, so a wrong guess finds zero ICDs instead of falling back). Let the
+        # loader find whatever mesa-vulkan-drivers installed on its own.
         run: xvfb-run -a ctest --output-on-failure

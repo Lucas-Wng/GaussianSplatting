@@ -73,8 +73,10 @@ build/GaussianSplatting/GaussianSplatting --bench[=N]      # N frames/mode, defa
 build/GaussianSplatting/GaussianSplatting --self-test       # headless radix correctness check; exits with pass/fail
 ```
 
-`--self-test` is also wired up as a CTest target (`ctest --output-on-failure` from `build/`)
-and runs in CI on both macOS and Linux (Mesa lavapipe).
+`--self-test` is also wired up as a CTest target (`ctest --output-on-failure` from `build/`).
+CI builds on both macOS and Linux, but only *runs* it on Linux (Mesa lavapipe): GitHub's
+hosted macOS runners sit behind a paravirtualized GPU that MoltenVK can't actually
+initialize against, so macOS CI is build/compile verification only.
 
 ## Controls
 
