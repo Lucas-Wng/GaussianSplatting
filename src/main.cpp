@@ -391,8 +391,15 @@ class Application
 
 	void cleanup()
 	{
-		glfwDestroyWindow(window);
+		// The surface wraps the GLFW window's native handle; it must be destroyed (along with
+		// anything built on it) before glfwDestroyWindow/glfwTerminate tear that handle down,
+		// not left to implicit RAII order, which would run after. Everything else (device,
+		// instance, ...) has no window dependency and is fine to destruct normally afterward.
+		device.waitIdle();
+		cleanupSwapChain();
+		surface = nullptr;
 
+		glfwDestroyWindow(window);
 		glfwTerminate();
 	}
 
@@ -411,6 +418,12 @@ class Application
 		cleanupSwapChain();
 		createSwapChain();
 		createImageViews();
+
+		// renderFinishedSemaphores is sized/indexed by swap image count, which createSwapChain
+		// may have just changed; recreate it to match or drawFrame indexes out of range.
+		renderFinishedSemaphores.clear();
+		for (size_t i = 0; i < swapChainImages.size(); i++)
+			renderFinishedSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
 	}
 
 	void createInstance()
@@ -514,6 +527,9 @@ class Application
 		                                                                     vk::PhysicalDeviceVulkan11Features,
 		                                                                     vk::PhysicalDeviceVulkan13Features,
 		                                                                     vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+		// shaderDrawParameters is required: Slang lowers SV_InstanceID to SPIR-V that declares
+		// the DrawParameters capability, which needs this feature even without an explicit
+		// gl_BaseInstance/gl_DrawID use.
 		bool supportsRequiredFeatures = features.template get<vk::PhysicalDeviceVulkan11Features>().shaderDrawParameters &&
 		                                features.template get<vk::PhysicalDeviceVulkan13Features>().dynamicRendering &&
 		                                features.template get<vk::PhysicalDeviceVulkan13Features>().synchronization2 &&
