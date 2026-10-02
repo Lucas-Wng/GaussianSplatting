@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -90,7 +91,8 @@ struct RadixPushConstants
 class Application
 {
   public:
-	explicit Application(std::string plyPath) : plyPath(std::move(plyPath)) {}
+	Application(std::string plyPath, std::filesystem::path resourceDir) :
+	    plyPath(std::move(plyPath)), resourceDir(std::move(resourceDir)) {}
 
 	void run()
 	{
@@ -103,6 +105,7 @@ class Application
 
   private:
 	std::string                      plyPath;
+	std::filesystem::path            resourceDir;        // directory containing the executable; shaders/models resolve against it
 	Scene                            scene;
 	uint32_t                         splatCount  = 0;
 	uint32_t                         paddedCount = 0;        // splatCount rounded up to a power of two (bitonic sort)
@@ -660,7 +663,7 @@ class Application
 
 	void createGraphicsPipeline()
 	{
-		vk::raii::ShaderModule shaderModule = createShaderModule(readFile("shaders/slang.spv"));
+		vk::raii::ShaderModule shaderModule = createShaderModule(readFile((resourceDir / "shaders/slang.spv").string()));
 
 		vk::PipelineShaderStageCreateInfo vertShaderStageInfo{.stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "vertMain"};
 		vk::PipelineShaderStageCreateInfo fragShaderStageInfo{.stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "fragMain"};
@@ -722,7 +725,7 @@ class Application
 
 	void createComputePipelines()
 	{
-		vk::raii::ShaderModule shaderModule = createShaderModule(readFile("shaders/compute.spv"));
+		vk::raii::ShaderModule shaderModule = createShaderModule(readFile((resourceDir / "shaders/compute.spv").string()));
 
 		vk::PushConstantRange pushRange{.stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = sizeof(SortPushConstants)};
 		vk::PipelineLayoutCreateInfo layoutInfo{
@@ -984,7 +987,7 @@ class Application
 		radixInitPipelineLayout =
 		    vk::raii::PipelineLayout(device, {.setLayoutCount = 1, .pSetLayouts = &*radixInitSetLayout, .pushConstantRangeCount = 1, .pPushConstantRanges = &initPcRange});
 
-		vk::raii::ShaderModule mod      = createShaderModule(readFile("shaders/radix.spv"));
+		vk::raii::ShaderModule mod      = createShaderModule(readFile((resourceDir / "shaders/radix.spv").string()));
 		auto                   makePipe = [&](const char *entry, vk::raii::PipelineLayout &layout) {
             vk::PipelineShaderStageCreateInfo stage{.stage = vk::ShaderStageFlagBits::eCompute, .module = mod, .pName = entry};
             return vk::raii::Pipeline(device, nullptr, vk::ComputePipelineCreateInfo{.stage = stage, .layout = layout});
@@ -1581,12 +1584,27 @@ class Application
 
 int main(int argc, char **argv)
 {
-	// Path to a pretrained 3DGS .ply; defaults to the bundled cactus scene.
-	std::string plyPath = (argc > 1) ? argv[1] : "models/cactus.ply";
+	// Shaders and the default model are resolved relative to the executable, not the
+	// current working directory, so the app runs correctly regardless of launch cwd.
+	std::filesystem::path resourceDir = std::filesystem::absolute(argv[0]).parent_path();
+
+	// Path to a pretrained 3DGS .ply; defaults to the bundled cactus scene. A user-supplied
+	// path is tried as given (absolute, or relative to cwd) and, failing that, relative to
+	// the executable's directory (so "models/foo.ply" works from any cwd too).
+	std::string plyPath;
+	if (argc > 1)
+	{
+		std::filesystem::path candidate(argv[1]);
+		plyPath = std::filesystem::exists(candidate) ? candidate.string() : (resourceDir / candidate).string();
+	}
+	else
+	{
+		plyPath = (resourceDir / "models/cactus.ply").string();
+	}
 
 	try
 	{
-		Application app(plyPath);
+		Application app(plyPath, resourceDir);
 		app.run();
 	}
 	catch (const std::exception &e)
