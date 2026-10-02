@@ -1112,6 +1112,9 @@ class Application
 		}
 	}
 
+	// Number of 8-bit digit passes needed to fully sort the low 32 bits of the depth key.
+	static constexpr uint32_t kDepthKeyPasses = 4;
+
 	// Sort rf's keyBuffer/valBuffer A ascending in place over `numPasses` 8-bit digits (result ends in A).
 	void recordRadix(vk::raii::CommandBuffer &cmd, RadixFrame &rf, uint32_t numPasses)
 	{
@@ -1274,8 +1277,12 @@ class Application
 		commandBuffer.dispatch(groups, 1, 1);
 		recordComputeBarrier(commandBuffer);
 
-		// 2) 8-pass LSD radix sort over the 64-bit key; result ends up in keyBufferA/valBufferA.
-		recordRadix(commandBuffer, rf, 8);
+		// 2) LSD radix sort over the depth key. The key is packed as uint2(lo, hi) for future
+		// 64-bit tile+depth keys, but the depth-only key currently used here only ever puts
+		// information in the low word (hi is 0 for real splats, and padding already sorts last
+		// on the low word alone via 0xFFFFFFFF) -- 4 passes over the low word is sufficient and
+		// halves this sort's cost versus the full 8-pass width runRadixSelfTest() validates.
+		recordRadix(commandBuffer, rf, kDepthKeyPasses);
 
 		// recordRadix's internal barriers only sync compute -> compute; the final scatter's
 		// write to valBufferA must also be made visible to the transfer stage before the copy below.

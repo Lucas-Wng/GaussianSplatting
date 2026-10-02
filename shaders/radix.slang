@@ -51,9 +51,19 @@ void radixHistogramMain(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, u
 }
 
 // --- Radix pass, step 3: stable scatter using the scanned (exclusive) blockHist ---
+//
+// Two-level counting sort over the 256-element block, instead of one thread doing a single
+// 256-iteration serial scan: split the block into kScatterGroups equal slices, each with its
+// own serial local-rank pass (phase A, parallel across group leaders -- 32 steps instead of
+// 256), then exclusive-scan each digit's per-group counts across groups (phase B, one thread
+// per digit value, fully parallel -- 8 steps). Stability is preserved because both phases
+// process elements/groups in increasing index order, same as the original single-thread scan.
 groupshared uint sDigit[256];
-groupshared uint sRank[256];
-groupshared uint sRun[256];
+groupshared uint sLocalRank[256];         // rank within this thread's own group, thread order
+groupshared uint sGroupCount[8 * 256];    // [group][digit]; count, then exclusive group-base
+
+static const uint kScatterGroups    = 8;
+static const uint kScatterGroupSize = 256u / kScatterGroups;        // 32
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -66,27 +76,46 @@ void radixScatterMain(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID, uin
     uint2 key = active ? keysIn[i] : uint2(0u, 0u);
     uint  val = active ? valsIn[i] : 0u;
     sDigit[t] = active ? keyDigit(key, pc.digit) : 0xFFFFFFFFu;
-    sRun[t]   = 0u;
+
+    for (uint k = 0u; k < kScatterGroups; ++k)
+        sGroupCount[k * 256u + t] = 0u;
     GroupMemoryBarrierWithGroupSync();
 
-    // Thread 0 assigns each active element a stable rank within its digit group (thread order).
-    if (t == 0u)
+    // Phase A: each group leader serially scans its own 32-wide slice.
+    uint myGroup = t / kScatterGroupSize;
+    if (t % kScatterGroupSize == 0u)
     {
-        for (uint e = 0u; e < 256u; ++e)
+        uint base = myGroup * kScatterGroupSize;
+        for (uint e = 0u; e < kScatterGroupSize; ++e)
         {
-            uint d = sDigit[e];
+            uint d = sDigit[base + e];
             if (d != 0xFFFFFFFFu)
             {
-                sRank[e] = sRun[d];
-                sRun[d]  = sRun[d] + 1u;
+                sLocalRank[base + e]     = sGroupCount[myGroup * 256u + d];
+                sGroupCount[myGroup * 256u + d] += 1u;
             }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Phase B: one thread per digit value (t == digit) exclusive-scans that digit's counts
+    // across the kScatterGroups groups, turning them into per-group base offsets in place.
+    {
+        uint digit = t;
+        uint run   = 0u;
+        for (uint g = 0u; g < kScatterGroups; ++g)
+        {
+            uint c                      = sGroupCount[g * 256u + digit];
+            sGroupCount[g * 256u + digit] = run;
+            run += c;
         }
     }
     GroupMemoryBarrierWithGroupSync();
 
     if (active)
     {
-        uint dest = blockHist[sDigit[t] * pc.numBlocks + gid.x] + sRank[t];
+        uint d    = sDigit[t];
+        uint dest = blockHist[d * pc.numBlocks + gid.x] + sGroupCount[myGroup * 256u + d] + sLocalRank[t];
         keysOut[dest] = key;
         valsOut[dest] = val;
     }
