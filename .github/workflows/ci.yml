@@ -25,9 +25,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/slang
-          gh release download --repo shader-slang/slang --pattern '*macos-aarch64*.zip' --dir /tmp/slang --clobber
+          # Anchored to match exactly one asset -- an unanchored pattern like
+          # '*macos-aarch64*.zip' also matches the '-debug-info' build, and unzip chokes
+          # when the glob below expands to more than one archive path.
+          gh release download --repo shader-slang/slang --pattern '*-macos-aarch64.zip' --dir /tmp/slang --clobber
           mkdir -p /tmp/slang-extracted
-          unzip -q /tmp/slang/*.zip -d /tmp/slang-extracted
+          archive="$(ls /tmp/slang/*.zip | head -n1)"
+          unzip -q "$archive" -d /tmp/slang-extracted
           echo "$(dirname "$(find /tmp/slang-extracted -name slangc | head -1)")" >> "$GITHUB_PATH"
 
       - name: Configure
@@ -58,9 +62,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p /tmp/slang
-          gh release download --repo shader-slang/slang --pattern '*linux-x86_64*.tar.gz' --dir /tmp/slang --clobber
+          # Anchored to match exactly one asset -- an unanchored pattern like
+          # '*linux-x86_64*.tar.gz' also matches '-debug-info'/'-glibc-2.27'/'-glibc-2.28'
+          # builds, and tar chokes when the glob below expands to more than one archive path.
+          gh release download --repo shader-slang/slang --pattern '*-linux-x86_64.tar.gz' --dir /tmp/slang --clobber
           mkdir -p /tmp/slang-extracted
-          tar -xzf /tmp/slang/*.tar.gz -C /tmp/slang-extracted
+          archive="$(ls /tmp/slang/*.tar.gz | head -n1)"
+          tar -xzf "$archive" -C /tmp/slang-extracted
           echo "$(dirname "$(find /tmp/slang-extracted -name slangc | head -1)")" >> "$GITHUB_PATH"
 
       - name: Configure
