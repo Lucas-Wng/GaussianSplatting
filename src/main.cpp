@@ -34,6 +34,9 @@ import vulkan_hpp;
 
 #include "camera.hpp"
 #include "ply_loader.hpp"
+#include "sort_bitonic.hpp"
+#include "sort_radix.hpp"
+#include "vk_utils.hpp"
 
 #include <string>
 
@@ -66,32 +69,6 @@ enum class SortMode
 	Cpu,        // std::sort on the host, memcpy into the index buffer
 	Gpu,        // compute bitonic sort, in place in the index buffer
 	Radix       // compute LSD radix sort, in place in the index buffer
-};
-
-// Must match RadixInitPush in shaders/radix.slang.
-struct RadixInitPushConstants
-{
-	glm::vec4 viewRow2;        // z = dot(viewRow2.xyz, pos) + viewRow2.w
-	uint32_t  splatCount;
-	uint32_t  paddedCount;
-};
-
-// Must match SortPush in shaders/compute.slang.
-struct SortPushConstants
-{
-	glm::vec4 viewRow2;        // z = dot(viewRow2.xyz, pos) + viewRow2.w
-	uint32_t  splatCount;
-	uint32_t  paddedCount;
-	uint32_t  j;               // bitonic partner stride
-	uint32_t  k;               // bitonic subsequence size
-};
-
-// Must match RadixPush in shaders/radix.slang.
-struct RadixPushConstants
-{
-	uint32_t count;            // active elements (radix) / scan length
-	uint32_t digit;            // 0..7: which 8-bit digit of the 64-bit key
-	uint32_t numBlocks;        // ceil(count / 256)
 };
 
 class Application
@@ -151,82 +128,28 @@ class Application
 	vk::raii::PipelineLayout      pipelineLayout      = nullptr;
 	vk::raii::Pipeline            graphicsPipeline    = nullptr;
 
-	// Compute sort: one set-0 layout shared by both pipelines (init + bitonic pass).
-	SortMode                             sortMode                   = SortMode::Cpu;
-	vk::raii::DescriptorSetLayout        computeDescriptorSetLayout = nullptr;
-	vk::raii::PipelineLayout             computePipelineLayout      = nullptr;
-	vk::raii::Pipeline                   sortInitPipeline           = nullptr;
-	vk::raii::Pipeline                   sortBitonicPipeline        = nullptr;
-	glm::vec4                            viewRow2{0.0f};        // this frame's view 3rd row, pushed to the sort
-	// computeDescriptorSets is declared after descriptorPool below so it destructs first.
+	SortMode  sortMode = SortMode::Cpu;
+	glm::vec4 viewRow2{0.0f};        // this frame's view 3rd row, pushed to the sort
+
+	// Each owns its own pipelines/descriptor pool/scratch buffers; see sort_bitonic.hpp and
+	// sort_radix.hpp. Self-contained (no stored references back into Application), so their
+	// position here only needs to be after device/physicalDevice, like everything below.
+	BitonicSorter bitonicSorter;
+	RadixSorter   radixSorter;
 
 	// All splats live in one device-local storage buffer, uploaded once.
 	vk::raii::Buffer       splatBuffer       = nullptr;
 	vk::raii::DeviceMemory splatBufferMemory = nullptr;
 
 	// Per-frame, host-visible, persistently-mapped sorted-index buffers (back-to-front order).
-	// Also serve as the bitonic sort's in-place "values" buffer in GPU mode.
+	// Shared by all three sort paths: the CPU path memcpy's into them directly, the bitonic
+	// sort writes in place into them (as its "values" buffer), and the radix sort copies its
+	// result into them. The graphics pipeline reads them as the final draw order.
 	std::vector<vk::raii::Buffer>       indexBuffers;
 	std::vector<vk::raii::DeviceMemory> indexBuffersMemory;
 	std::vector<void *>                 indexBuffersMapped;
 	std::vector<uint32_t>               sortedIndices;        // CPU scratch reused each frame
 	std::vector<float>                  splatDepths;          // CPU scratch reused each frame
-
-	// Per-frame device-local key buffers (compute-only scratch for the bitonic sort).
-	std::vector<vk::raii::Buffer>       sortKeyBuffers;
-	std::vector<vk::raii::DeviceMemory> sortKeyBuffersMemory;
-
-	// --- LSD radix sort (key = uint2, value = uint). Ping-pong A/B buffers, duplicated per
-	// frame in flight so frame N+1's dispatches never race frame N's still-running GPU work
-	// on the same scratch buffers (unlike the layouts/pipelines below, which are stateless
-	// and shared). ---
-	uint32_t radixCapacity  = 0;        // padded element count (multiple of 256)
-	uint32_t radixNumBlocks = 0;        // radixCapacity / 256
-
-	// One exclusive-scan level per recursion step over the block histogram.
-	struct ScanLevel
-	{
-		vk::raii::Buffer       sums    = nullptr;
-		vk::raii::DeviceMemory sumsMem = nullptr;
-		uint32_t               dataLen   = 0;        // elements scanned at this level
-		uint32_t               numBlocks = 0;        // ceil(dataLen / 256)
-	};
-
-	struct RadixFrame
-	{
-		vk::raii::Buffer       keyBufferA = nullptr, keyBufferB = nullptr;
-		vk::raii::DeviceMemory keyBufferAMem = nullptr, keyBufferBMem = nullptr;
-		vk::raii::Buffer       valBufferA = nullptr, valBufferB = nullptr;
-		vk::raii::DeviceMemory valBufferAMem = nullptr, valBufferBMem = nullptr;
-		vk::raii::Buffer       blockHistBuffer    = nullptr;
-		vk::raii::DeviceMemory blockHistBufferMem = nullptr;
-		std::vector<ScanLevel> scanLevels;
-
-		vk::raii::DescriptorSet              radixSetAB   = nullptr;        // A -> B
-		vk::raii::DescriptorSet              radixSetBA   = nullptr;        // B -> A
-		vk::raii::DescriptorSet              radixInitSet = nullptr;        // splats -> A
-		std::vector<vk::raii::DescriptorSet> scanSets;                      // one per scan level
-	};
-
-	// Must be declared (and so destructed) *before* radixFrames: members destruct in reverse
-	// declaration order, and the sets living in radixFrames[] must be freed back to this pool
-	// while it's still alive, not after.
-	vk::raii::DescriptorPool radixDescriptorPool = nullptr;
-	std::vector<RadixFrame>  radixFrames;        // one per frame in flight
-
-	vk::raii::DescriptorSetLayout radixSetLayout       = nullptr;        // bindings 0-4
-	vk::raii::DescriptorSetLayout scanSetLayout        = nullptr;        // bindings 5-6
-	vk::raii::PipelineLayout      radixPipelineLayout  = nullptr;
-	vk::raii::PipelineLayout      scanPipelineLayout   = nullptr;
-	vk::raii::Pipeline            radixHistogramPipeline = nullptr;
-	vk::raii::Pipeline            radixScatterPipeline   = nullptr;
-	vk::raii::Pipeline            scanBlockPipeline      = nullptr;
-	vk::raii::Pipeline            scanAddPipeline        = nullptr;
-
-	// Depth-key init pass: splats -> (keyBufferA, valBufferA). Own set/layout (bindings 0-2).
-	vk::raii::DescriptorSetLayout radixInitSetLayout      = nullptr;
-	vk::raii::PipelineLayout      radixInitPipelineLayout = nullptr;
-	vk::raii::Pipeline            radixInitPipeline       = nullptr;
 
 	std::vector<vk::raii::Buffer>       uniformBuffers;
 	std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
@@ -375,23 +298,20 @@ class Application
 		createSwapChain();
 		createImageViews();
 		createDescriptorSetLayout();
-		createComputeDescriptorSetLayout();
 		createGraphicsPipeline();
-		createComputePipelines();
 		createCommandPool();
 		createSplatBuffer();
 		createIndexBuffers();
-		createSortKeyBuffers();
 		createUniformBuffers();
 		createDescriptorPool();
 		createDescriptorSets();
-		createComputeDescriptorSets();
-		createRadixResources();
+		bitonicSorter.create(device, physicalDevice, (resourceDir / "shaders/compute.spv").string(), splatBuffer, splatCount, paddedCount, indexBuffers);
+		radixSorter.create(device, physicalDevice, (resourceDir / "shaders/radix.spv").string(), splatBuffer, splatCount, paddedCount, MAX_FRAMES_IN_FLIGHT);
 		createCommandBuffers();
 		createSyncObjects();
 		createQueryPool();
 		if (selfTestOnly)
-			selfTestPassed = runRadixSelfTest();
+			selfTestPassed = radixSorter.selfTest(device, physicalDevice, commandPool, queue);
 	}
 
 	void mainLoop()
@@ -798,25 +718,9 @@ class Application
 		descriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
 	}
 
-	void createComputeDescriptorSetLayout()
-	{
-		std::array bindings{
-		    // binding 0: splat data (read) — positions for depth keys
-		    vk::DescriptorSetLayoutBinding{
-		        .binding = 0, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
-		    // binding 1: sort keys (read/write scratch)
-		    vk::DescriptorSetLayoutBinding{
-		        .binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
-		    // binding 2: sort values == draw indices (read/write, sorted in place)
-		    vk::DescriptorSetLayoutBinding{
-		        .binding = 2, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute}};
-		vk::DescriptorSetLayoutCreateInfo layoutInfo{.bindingCount = static_cast<uint32_t>(bindings.size()), .pBindings = bindings.data()};
-		computeDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
-	}
-
 	void createGraphicsPipeline()
 	{
-		vk::raii::ShaderModule shaderModule = createShaderModule(readFile((resourceDir / "shaders/slang.spv").string()));
+		vk::raii::ShaderModule shaderModule = vkutil::createShaderModule(device, vkutil::readFile((resourceDir / "shaders/slang.spv").string()));
 
 		vk::PipelineShaderStageCreateInfo vertShaderStageInfo{.stage = vk::ShaderStageFlagBits::eVertex, .module = shaderModule, .pName = "vertMain"};
 		vk::PipelineShaderStageCreateInfo fragShaderStageInfo{.stage = vk::ShaderStageFlagBits::eFragment, .module = shaderModule, .pName = "fragMain"};
@@ -876,24 +780,6 @@ class Application
 		graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineCreateInfoChain.get<vk::GraphicsPipelineCreateInfo>());
 	}
 
-	void createComputePipelines()
-	{
-		vk::raii::ShaderModule shaderModule = createShaderModule(readFile((resourceDir / "shaders/compute.spv").string()));
-
-		vk::PushConstantRange pushRange{.stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = sizeof(SortPushConstants)};
-		vk::PipelineLayoutCreateInfo layoutInfo{
-		    .setLayoutCount = 1, .pSetLayouts = &*computeDescriptorSetLayout, .pushConstantRangeCount = 1, .pPushConstantRanges = &pushRange};
-		computePipelineLayout = vk::raii::PipelineLayout(device, layoutInfo);
-
-		auto makePipeline = [&](const char *entry) {
-			vk::PipelineShaderStageCreateInfo stage{.stage = vk::ShaderStageFlagBits::eCompute, .module = shaderModule, .pName = entry};
-			vk::ComputePipelineCreateInfo     info{.stage = stage, .layout = computePipelineLayout};
-			return vk::raii::Pipeline(device, nullptr, info);
-		};
-		sortInitPipeline    = makePipeline("sortInitMain");
-		sortBitonicPipeline = makePipeline("sortBitonicMain");
-	}
-
 	void createCommandPool()
 	{
 		vk::CommandPoolCreateInfo poolInfo{.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -901,32 +787,21 @@ class Application
 		commandPool = vk::raii::CommandPool(device, poolInfo);
 	}
 
-	std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties)
-	{
-		vk::BufferCreateInfo   bufferInfo{.size = size, .usage = usage, .sharingMode = vk::SharingMode::eExclusive};
-		vk::raii::Buffer       buffer          = vk::raii::Buffer(device, bufferInfo);
-		vk::MemoryRequirements memRequirements = buffer.getMemoryRequirements();
-		vk::MemoryAllocateInfo allocInfo{.allocationSize = memRequirements.size, .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties)};
-		vk::raii::DeviceMemory bufferMemory = vk::raii::DeviceMemory(device, allocInfo);
-		buffer.bindMemory(*bufferMemory, 0);
-		return {std::move(buffer), std::move(bufferMemory)};
-	}
-
 	void createSplatBuffer()
 	{
 		vk::DeviceSize bufferSize = sizeof(GpuSplat) * scene.splats.size();
 
-		auto [stagingBuffer, stagingBufferMemory] =
-		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+		auto [stagingBuffer, stagingBufferMemory] = vkutil::createBuffer(
+		    device, physicalDevice, bufferSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
 
 		void *dataStaging = stagingBufferMemory.mapMemory(0, bufferSize);
 		memcpy(dataStaging, scene.splats.data(), bufferSize);
 		stagingBufferMemory.unmapMemory();
 
-		std::tie(splatBuffer, splatBufferMemory) =
-		    createBuffer(bufferSize, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
+		std::tie(splatBuffer, splatBufferMemory) = vkutil::createBuffer(
+		    device, physicalDevice, bufferSize, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
 
-		copyBuffer(stagingBuffer, splatBuffer, bufferSize);
+		vkutil::copyBuffer(device, commandPool, queue, stagingBuffer, splatBuffer, bufferSize);
 	}
 
 	void createIndexBuffers()
@@ -937,25 +812,12 @@ class Application
 		vk::DeviceSize bufferSize = sizeof(uint32_t) * paddedCount;
 		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		{
-			auto [buffer, bufferMem] = createBuffer(bufferSize,
-			                                        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
-			                                        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+			auto [buffer, bufferMem] = vkutil::createBuffer(device, physicalDevice, bufferSize,
+			                                                vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+			                                                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
 			indexBuffers.emplace_back(std::move(buffer));
 			indexBuffersMemory.emplace_back(std::move(bufferMem));
 			indexBuffersMapped.emplace_back(indexBuffersMemory.back().mapMemory(0, bufferSize));
-		}
-	}
-
-	void createSortKeyBuffers()
-	{
-		// Per-frame device-local scratch holding the bitonic sort's depth keys.
-		vk::DeviceSize bufferSize = sizeof(uint32_t) * paddedCount;
-		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
-		{
-			auto [buffer, bufferMem] =
-			    createBuffer(bufferSize, vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal);
-			sortKeyBuffers.emplace_back(std::move(buffer));
-			sortKeyBuffersMemory.emplace_back(std::move(bufferMem));
 		}
 	}
 
@@ -964,22 +826,23 @@ class Application
 		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 		{
 			vk::DeviceSize bufferSize = sizeof(UniformBufferObject);
-			auto [buffer, bufferMem]  = createBuffer(
-			    bufferSize, vk::BufferUsageFlagBits::eUniformBuffer, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+			auto [buffer, bufferMem]  = vkutil::createBuffer(
+			    device, physicalDevice, bufferSize, vk::BufferUsageFlagBits::eUniformBuffer, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
 			uniformBuffers.emplace_back(std::move(buffer));
 			uniformBuffersMemory.emplace_back(std::move(bufferMem));
 			uniformBuffersMapped.emplace_back(uniformBuffersMemory.back().mapMemory(0, bufferSize));
 		}
 	}
 
+	// Graphics descriptor sets only (1 UBO + 2 storage per frame); BitonicSorter and
+	// RadixSorter each own their own dedicated descriptor pool.
 	void createDescriptorPool()
 	{
 		std::array poolSizes{
 		    vk::DescriptorPoolSize{.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = MAX_FRAMES_IN_FLIGHT},
-		    // graphics: splat + index per frame (2); compute: splat + keys + values per frame (3)
-		    vk::DescriptorPoolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 5 * MAX_FRAMES_IN_FLIGHT}};
+		    vk::DescriptorPoolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 2 * MAX_FRAMES_IN_FLIGHT}};
 		vk::DescriptorPoolCreateInfo poolInfo{.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-		                                      .maxSets       = 2 * MAX_FRAMES_IN_FLIGHT,        // graphics set + compute set per frame
+		                                      .maxSets       = MAX_FRAMES_IN_FLIGHT,
 		                                      .poolSizeCount = static_cast<uint32_t>(poolSizes.size()),
 		                                      .pPoolSizes    = poolSizes.data()};
 		descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
@@ -1008,438 +871,11 @@ class Application
 		}
 	}
 
-	void createComputeDescriptorSets()
-	{
-		std::vector<vk::DescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, *computeDescriptorSetLayout);
-		vk::DescriptorSetAllocateInfo        allocInfo{.descriptorPool     = descriptorPool,
-		                                               .descriptorSetCount = static_cast<uint32_t>(layouts.size()),
-		                                               .pSetLayouts        = layouts.data()};
-
-		computeDescriptorSets = device.allocateDescriptorSets(allocInfo);
-
-		for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
-		{
-			vk::DescriptorBufferInfo splatInfo{.buffer = splatBuffer, .offset = 0, .range = sizeof(GpuSplat) * splatCount};
-			vk::DescriptorBufferInfo keyInfo{.buffer = sortKeyBuffers[i], .offset = 0, .range = sizeof(uint32_t) * paddedCount};
-			vk::DescriptorBufferInfo valueInfo{.buffer = indexBuffers[i], .offset = 0, .range = sizeof(uint32_t) * paddedCount};
-
-			std::array descriptorWrites{
-			    vk::WriteDescriptorSet{.dstSet = computeDescriptorSets[i], .dstBinding = 0, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &splatInfo},
-			    vk::WriteDescriptorSet{.dstSet = computeDescriptorSets[i], .dstBinding = 1, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &keyInfo},
-			    vk::WriteDescriptorSet{.dstSet = computeDescriptorSets[i], .dstBinding = 2, .dstArrayElement = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &valueInfo}};
-			device.updateDescriptorSets(descriptorWrites, {});
-		}
-	}
-
-	void copyBuffer(vk::raii::Buffer &srcBuffer, vk::raii::Buffer &dstBuffer, vk::DeviceSize size)
-	{
-		vk::CommandBufferAllocateInfo allocInfo{.commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1};
-		vk::raii::CommandBuffer       commandCopyBuffer = std::move(device.allocateCommandBuffers(allocInfo).front());
-		commandCopyBuffer.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-		commandCopyBuffer.copyBuffer(*srcBuffer, *dstBuffer, vk::BufferCopy(0, 0, size));
-		commandCopyBuffer.end();
-		queue.submit(vk::SubmitInfo{.commandBufferCount = 1, .pCommandBuffers = &*commandCopyBuffer}, nullptr);
-		queue.waitIdle();
-	}
-
-	// Global compute->compute barrier (storage write -> read/write) between dependent dispatches.
-	void recordComputeBarrier(vk::raii::CommandBuffer &cmd)
-	{
-		vk::MemoryBarrier2 b{
-		    .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
-		    .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-		    .dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
-		    .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite};
-		cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &b});
-	}
-
-	void uploadToDevice(vk::raii::Buffer &dst, const void *src, vk::DeviceSize size)
-	{
-		auto [staging, stagingMem] =
-		    createBuffer(size, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-		void *p = stagingMem.mapMemory(0, size);
-		memcpy(p, src, size);
-		stagingMem.unmapMemory();
-		copyBuffer(staging, dst, size);
-	}
-
-	void readbackFromDevice(vk::raii::Buffer &src, void *dst, vk::DeviceSize size)
-	{
-		auto [staging, stagingMem] =
-		    createBuffer(size, vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-		copyBuffer(src, staging, size);
-		void *p = stagingMem.mapMemory(0, size);
-		memcpy(dst, p, size);
-		stagingMem.unmapMemory();
-	}
-
-	void writeRadixSet(vk::raii::DescriptorSet &set, vk::raii::Buffer &kin, vk::raii::Buffer &vin, vk::raii::Buffer &kout, vk::raii::Buffer &vout, vk::raii::Buffer &blockHist)
-	{
-		vk::DescriptorBufferInfo kinInfo{.buffer = kin, .offset = 0, .range = sizeof(uint64_t) * radixCapacity};
-		vk::DescriptorBufferInfo vinInfo{.buffer = vin, .offset = 0, .range = sizeof(uint32_t) * radixCapacity};
-		vk::DescriptorBufferInfo koutInfo{.buffer = kout, .offset = 0, .range = sizeof(uint64_t) * radixCapacity};
-		vk::DescriptorBufferInfo voutInfo{.buffer = vout, .offset = 0, .range = sizeof(uint32_t) * radixCapacity};
-		vk::DescriptorBufferInfo bhInfo{.buffer = blockHist, .offset = 0, .range = sizeof(uint32_t) * radixCapacity};
-		std::array w{
-		    vk::WriteDescriptorSet{.dstSet = set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &kinInfo},
-		    vk::WriteDescriptorSet{.dstSet = set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &vinInfo},
-		    vk::WriteDescriptorSet{.dstSet = set, .dstBinding = 2, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &koutInfo},
-		    vk::WriteDescriptorSet{.dstSet = set, .dstBinding = 3, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &voutInfo},
-		    vk::WriteDescriptorSet{.dstSet = set, .dstBinding = 4, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &bhInfo}};
-		device.updateDescriptorSets(w, {});
-	}
-
-	void writeScanSet(vk::raii::DescriptorSet &set, vk::raii::Buffer &data, vk::raii::Buffer &sums)
-	{
-		vk::DescriptorBufferInfo dataInfo{.buffer = data, .offset = 0, .range = vk::WholeSize};
-		vk::DescriptorBufferInfo sumsInfo{.buffer = sums, .offset = 0, .range = vk::WholeSize};
-		std::array w{
-		    vk::WriteDescriptorSet{.dstSet = set, .dstBinding = 5, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &dataInfo},
-		    vk::WriteDescriptorSet{.dstSet = set, .dstBinding = 6, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &sumsInfo}};
-		device.updateDescriptorSets(w, {});
-	}
-
-	void createRadixResources()
-	{
-		radixCapacity  = std::max(256u, paddedCount);        // reuse the per-splat padded count
-		radixNumBlocks = radixCapacity / 256u;
-
-		auto makeDeviceBuffer = [&](vk::DeviceSize size) {
-			return createBuffer(size,
-			                    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
-			                    vk::MemoryPropertyFlagBits::eDeviceLocal);
-		};
-
-		// Descriptor set layouts: radix (bindings 0-4), scan (bindings 5-6).
-		{
-			std::array<vk::DescriptorSetLayoutBinding, 5> b{};
-			for (uint32_t i = 0; i < b.size(); ++i)
-				b[i] = {.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute};
-			radixSetLayout = vk::raii::DescriptorSetLayout(device, {.bindingCount = static_cast<uint32_t>(b.size()), .pBindings = b.data()});
-		}
-		{
-			std::array b{
-			    vk::DescriptorSetLayoutBinding{.binding = 5, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
-			    vk::DescriptorSetLayoutBinding{.binding = 6, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute}};
-			scanSetLayout = vk::raii::DescriptorSetLayout(device, {.bindingCount = static_cast<uint32_t>(b.size()), .pBindings = b.data()});
-		}
-
-		vk::PushConstantRange pcRange{.stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = sizeof(RadixPushConstants)};
-		radixPipelineLayout = vk::raii::PipelineLayout(device, {.setLayoutCount = 1, .pSetLayouts = &*radixSetLayout, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcRange});
-		scanPipelineLayout  = vk::raii::PipelineLayout(device, {.setLayoutCount = 1, .pSetLayouts = &*scanSetLayout, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcRange});
-
-		// Depth-key init: splats(7) -> keysOut(8)/valsOut(9), own layout/set.
-		{
-			std::array b{
-			    vk::DescriptorSetLayoutBinding{.binding = 7, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
-			    vk::DescriptorSetLayoutBinding{.binding = 8, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
-			    vk::DescriptorSetLayoutBinding{.binding = 9, .descriptorType = vk::DescriptorType::eStorageBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute}};
-			radixInitSetLayout = vk::raii::DescriptorSetLayout(device, {.bindingCount = static_cast<uint32_t>(b.size()), .pBindings = b.data()});
-		}
-		vk::PushConstantRange initPcRange{.stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = sizeof(RadixInitPushConstants)};
-		radixInitPipelineLayout =
-		    vk::raii::PipelineLayout(device, {.setLayoutCount = 1, .pSetLayouts = &*radixInitSetLayout, .pushConstantRangeCount = 1, .pPushConstantRanges = &initPcRange});
-
-		vk::raii::ShaderModule mod      = createShaderModule(readFile((resourceDir / "shaders/radix.spv").string()));
-		auto                   makePipe = [&](const char *entry, vk::raii::PipelineLayout &layout) {
-            vk::PipelineShaderStageCreateInfo stage{.stage = vk::ShaderStageFlagBits::eCompute, .module = mod, .pName = entry};
-            return vk::raii::Pipeline(device, nullptr, vk::ComputePipelineCreateInfo{.stage = stage, .layout = layout});
-		};
-		radixHistogramPipeline = makePipe("radixHistogramMain", radixPipelineLayout);
-		radixScatterPipeline   = makePipe("radixScatterMain", radixPipelineLayout);
-		scanBlockPipeline      = makePipe("scanBlockMain", scanPipelineLayout);
-		scanAddPipeline        = makePipe("scanAddMain", scanPipelineLayout);
-		radixInitPipeline      = makePipe("radixDepthInitMain", radixInitPipelineLayout);
-
-		// Scan levels (lengths) over the block histogram are the same shape for every frame.
-		std::vector<uint32_t> scanLens;
-		std::vector<uint32_t> scanBlocks;
-		for (uint32_t len = radixCapacity;;)
-		{
-			uint32_t nb = (len + 255u) / 256u;
-			scanLens.push_back(len);
-			scanBlocks.push_back(nb);
-			if (nb <= 1u)
-				break;
-			len = nb;
-		}
-		uint32_t numScan = static_cast<uint32_t>(scanLens.size());
-
-		std::array poolSizes{vk::DescriptorPoolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = (13u + 2u * numScan) * MAX_FRAMES_IN_FLIGHT}};
-		radixDescriptorPool = vk::raii::DescriptorPool(device, {.flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-		                                                        .maxSets       = (3u + numScan) * MAX_FRAMES_IN_FLIGHT,
-		                                                        .poolSizeCount = 1,
-		                                                        .pPoolSizes    = poolSizes.data()});
-
-		auto allocOne = [&](vk::raii::DescriptorSetLayout &layout) {
-			vk::DescriptorSetAllocateInfo ai{.descriptorPool = radixDescriptorPool, .descriptorSetCount = 1, .pSetLayouts = &*layout};
-			return std::move(device.allocateDescriptorSets(ai).front());
-		};
-
-		radixFrames.clear();
-		for (int f = 0; f < MAX_FRAMES_IN_FLIGHT; ++f)
-		{
-			RadixFrame rf;
-			std::tie(rf.keyBufferA, rf.keyBufferAMem)           = makeDeviceBuffer(sizeof(uint64_t) * radixCapacity);
-			std::tie(rf.keyBufferB, rf.keyBufferBMem)           = makeDeviceBuffer(sizeof(uint64_t) * radixCapacity);
-			std::tie(rf.valBufferA, rf.valBufferAMem)           = makeDeviceBuffer(sizeof(uint32_t) * radixCapacity);
-			std::tie(rf.valBufferB, rf.valBufferBMem)           = makeDeviceBuffer(sizeof(uint32_t) * radixCapacity);
-			std::tie(rf.blockHistBuffer, rf.blockHistBufferMem) = makeDeviceBuffer(sizeof(uint32_t) * radixCapacity);
-
-			for (uint32_t k = 0; k < numScan; ++k)
-			{
-				ScanLevel lvl;
-				lvl.dataLen                     = scanLens[k];
-				lvl.numBlocks                   = scanBlocks[k];
-				std::tie(lvl.sums, lvl.sumsMem) = makeDeviceBuffer(sizeof(uint32_t) * lvl.numBlocks);
-				rf.scanLevels.push_back(std::move(lvl));
-			}
-
-			rf.radixSetAB = allocOne(radixSetLayout);
-			rf.radixSetBA = allocOne(radixSetLayout);
-			writeRadixSet(rf.radixSetAB, rf.keyBufferA, rf.valBufferA, rf.keyBufferB, rf.valBufferB, rf.blockHistBuffer);
-			writeRadixSet(rf.radixSetBA, rf.keyBufferB, rf.valBufferB, rf.keyBufferA, rf.valBufferA, rf.blockHistBuffer);
-
-			rf.radixInitSet = allocOne(radixInitSetLayout);
-			{
-				vk::DescriptorBufferInfo splatInfo{.buffer = splatBuffer, .offset = 0, .range = sizeof(GpuSplat) * splatCount};
-				vk::DescriptorBufferInfo koutInfo{.buffer = rf.keyBufferA, .offset = 0, .range = sizeof(uint64_t) * radixCapacity};
-				vk::DescriptorBufferInfo voutInfo{.buffer = rf.valBufferA, .offset = 0, .range = sizeof(uint32_t) * radixCapacity};
-				std::array w{
-				    vk::WriteDescriptorSet{.dstSet = rf.radixInitSet, .dstBinding = 7, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &splatInfo},
-				    vk::WriteDescriptorSet{.dstSet = rf.radixInitSet, .dstBinding = 8, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &koutInfo},
-				    vk::WriteDescriptorSet{.dstSet = rf.radixInitSet, .dstBinding = 9, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &voutInfo}};
-				device.updateDescriptorSets(w, {});
-			}
-
-			for (uint32_t k = 0; k < numScan; ++k)
-			{
-				rf.scanSets.push_back(allocOne(scanSetLayout));
-				vk::raii::Buffer &data = (k == 0) ? rf.blockHistBuffer : rf.scanLevels[k - 1].sums;
-				writeScanSet(rf.scanSets[k], data, rf.scanLevels[k].sums);
-			}
-
-			radixFrames.push_back(std::move(rf));
-		}
-	}
-
-	// Exclusive prefix sum of blockHistBuffer, in place (multi-level; scans block sums recursively).
-	void recordScan(vk::raii::CommandBuffer &cmd, RadixFrame &rf)
-	{
-		cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *scanBlockPipeline);
-		for (size_t k = 0; k < rf.scanLevels.size(); ++k)
-		{
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, scanPipelineLayout, 0, *rf.scanSets[k], nullptr);
-			RadixPushConstants pc{.count = rf.scanLevels[k].dataLen, .digit = 0, .numBlocks = rf.scanLevels[k].numBlocks};
-			cmd.pushConstants<RadixPushConstants>(scanPipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
-			cmd.dispatch(rf.scanLevels[k].numBlocks, 1, 1);
-			recordComputeBarrier(cmd);
-		}
-		cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *scanAddPipeline);
-		for (size_t k = rf.scanLevels.size(); k-- > 0;)
-		{
-			if (rf.scanLevels[k].numBlocks <= 1u)
-				continue;        // deepest level was fully scanned in one block
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, scanPipelineLayout, 0, *rf.scanSets[k], nullptr);
-			RadixPushConstants pc{.count = rf.scanLevels[k].dataLen, .digit = 0, .numBlocks = rf.scanLevels[k].numBlocks};
-			cmd.pushConstants<RadixPushConstants>(scanPipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
-			cmd.dispatch(rf.scanLevels[k].numBlocks, 1, 1);
-			recordComputeBarrier(cmd);
-		}
-	}
-
-	// Number of 8-bit digit passes needed to fully sort the low 32 bits of the depth key.
-	static constexpr uint32_t kDepthKeyPasses = 4;
-
-	// Sort rf's keyBuffer/valBuffer A ascending in place over `numPasses` 8-bit digits (result ends in A).
-	void recordRadix(vk::raii::CommandBuffer &cmd, RadixFrame &rf, uint32_t numPasses)
-	{
-		for (uint32_t p = 0; p < numPasses; ++p)
-		{
-			vk::raii::DescriptorSet &set = (p % 2u == 0u) ? rf.radixSetAB : rf.radixSetBA;
-			RadixPushConstants       pc{.count = radixCapacity, .digit = p, .numBlocks = radixNumBlocks};
-
-			cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *radixHistogramPipeline);
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, radixPipelineLayout, 0, *set, nullptr);
-			cmd.pushConstants<RadixPushConstants>(radixPipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
-			cmd.dispatch(radixNumBlocks, 1, 1);
-			recordComputeBarrier(cmd);
-
-			recordScan(cmd, rf);
-			recordComputeBarrier(cmd);
-
-			cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *radixScatterPipeline);
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, radixPipelineLayout, 0, *set, nullptr);
-			cmd.pushConstants<RadixPushConstants>(radixPipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
-			cmd.dispatch(radixNumBlocks, 1, 1);
-			recordComputeBarrier(cmd);
-		}
-	}
-
-	// Headless correctness check: sort random 64-bit keys on the GPU and compare to std::sort.
-	// Returns true on success; run unconditionally with --self-test (see main()), or on demand.
-	bool runRadixSelfTest()
-	{
-		RadixFrame           &rf = radixFrames[0];
-		uint32_t              n  = radixCapacity;
-		std::vector<uint64_t> keys(n);
-		std::vector<uint32_t> vals(n);
-		std::mt19937_64       rng(0x1234u);
-		for (uint32_t i = 0; i < n; ++i)
-		{
-			keys[i] = rng();        // full 64-bit keys exercise both words (as tile keys do)
-			vals[i] = i;
-		}
-
-		uploadToDevice(rf.keyBufferA, keys.data(), sizeof(uint64_t) * n);
-		uploadToDevice(rf.valBufferA, vals.data(), sizeof(uint32_t) * n);
-
-		{
-			vk::CommandBufferAllocateInfo ai{.commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1};
-			vk::raii::CommandBuffer       cmd = std::move(device.allocateCommandBuffers(ai).front());
-			cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-			recordRadix(cmd, rf, 8);        // 64-bit keys -> 8 digit passes
-			cmd.end();
-			queue.submit(vk::SubmitInfo{.commandBufferCount = 1, .pCommandBuffers = &*cmd}, nullptr);
-			queue.waitIdle();
-		}
-
-		std::vector<uint64_t> outKeys(n);
-		std::vector<uint32_t> outVals(n);
-		readbackFromDevice(rf.keyBufferA, outKeys.data(), sizeof(uint64_t) * n);
-		readbackFromDevice(rf.valBufferA, outVals.data(), sizeof(uint32_t) * n);
-
-		bool ok = true;
-		for (uint32_t i = 1; i < n && ok; ++i)
-			if (outKeys[i - 1] > outKeys[i])
-				ok = false;
-		for (uint32_t i = 0; i < n && ok; ++i)
-			if (keys[outVals[i]] != outKeys[i])
-				ok = false;
-		if (ok)
-		{
-			std::vector<uint64_t> ref = keys;
-			std::sort(ref.begin(), ref.end());
-			if (ref != outKeys)
-				ok = false;
-		}
-		std::cout << "radix self-test (" << n << " keys): " << (ok ? "PASS" : "FAIL") << std::endl;
-
-		// Re-seed the depth-init descriptor writes; the self-test clobbered rf's A buffers with
-		// arbitrary test data, but the descriptor bindings themselves are untouched, so nothing
-		// further is required here — recordRadixSort's init pass overwrites A unconditionally.
-		return ok;
-	}
-
-	uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties)
-	{
-		vk::PhysicalDeviceMemoryProperties memProperties = physicalDevice.getMemoryProperties();
-
-		for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
-		{
-			if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties)
-			{
-				return i;
-			}
-		}
-
-		throw std::runtime_error("failed to find suitable memory type!");
-	}
-
 	void createCommandBuffers()
 	{
 		commandBuffers.clear();
 		vk::CommandBufferAllocateInfo allocInfo{.commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = MAX_FRAMES_IN_FLIGHT};
 		commandBuffers = vk::raii::CommandBuffers(device, allocInfo);
-	}
-
-	// Record the GPU bitonic sort, leaving back-to-front draw indices in indexBuffers[frameIndex].
-	void recordSort()
-	{
-		auto &commandBuffer = commandBuffers[frameIndex];
-
-		SortPushConstants pc{.viewRow2 = viewRow2, .splatCount = splatCount, .paddedCount = paddedCount, .j = 0, .k = 0};
-
-		// Serializes dependent dispatches (write -> read/write).
-		const vk::MemoryBarrier2 computeBarrier{
-		    .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
-		    .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-		    .dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
-		    .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite};
-		const vk::DependencyInfo computeDependency{.memoryBarrierCount = 1, .pMemoryBarriers = &computeBarrier};
-
-		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, computePipelineLayout, 0, *computeDescriptorSets[frameIndex], nullptr);
-
-		// 1) Fill keys (order-preserving depth) and identity values for every padded slot.
-		commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *sortInitPipeline);
-		commandBuffer.pushConstants<SortPushConstants>(computePipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
-		uint32_t groups = (paddedCount + 255u) / 256u;
-		commandBuffer.dispatch(groups, 1, 1);
-		commandBuffer.pipelineBarrier2(computeDependency);
-
-		// 2) Bitonic network: one dispatch per (k, j) stage, in place on keys + values.
-		commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *sortBitonicPipeline);
-		for (uint32_t k = 2; k <= paddedCount; k <<= 1)
-		{
-			for (uint32_t j = k >> 1; j > 0; j >>= 1)
-			{
-				pc.k = k;
-				pc.j = j;
-				commandBuffer.pushConstants<SortPushConstants>(computePipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, pc);
-				commandBuffer.dispatch(groups, 1, 1);
-				commandBuffer.pipelineBarrier2(computeDependency);
-			}
-		}
-
-		// 3) Hand the sorted indices to the vertex stage.
-		const vk::MemoryBarrier2 toVertexBarrier{
-		    .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
-		    .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-		    .dstStageMask  = vk::PipelineStageFlagBits2::eVertexShader,
-		    .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead};
-		commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toVertexBarrier});
-	}
-
-	// Record the GPU radix sort, leaving back-to-front draw indices in indexBuffers[frameIndex].
-	void recordRadixSort()
-	{
-		auto &commandBuffer = commandBuffers[frameIndex];
-		auto &rf            = radixFrames[frameIndex];
-
-		// 1) Seed keyBufferA/valBufferA from splat depth (real splats) + max-key padding.
-		RadixInitPushConstants initPc{.viewRow2 = viewRow2, .splatCount = splatCount, .paddedCount = radixCapacity};
-		commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *radixInitPipeline);
-		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, radixInitPipelineLayout, 0, *rf.radixInitSet, nullptr);
-		commandBuffer.pushConstants<RadixInitPushConstants>(radixInitPipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, initPc);
-		uint32_t groups = (radixCapacity + 255u) / 256u;
-		commandBuffer.dispatch(groups, 1, 1);
-		recordComputeBarrier(commandBuffer);
-
-		// 2) LSD radix sort over the depth key. The key is packed as uint2(lo, hi) for future
-		// 64-bit tile+depth keys, but the depth-only key currently used here only ever puts
-		// information in the low word (hi is 0 for real splats, and padding already sorts last
-		// on the low word alone via 0xFFFFFFFF) -- 4 passes over the low word is sufficient and
-		// halves this sort's cost versus the full 8-pass width runRadixSelfTest() validates.
-		recordRadix(commandBuffer, rf, kDepthKeyPasses);
-
-		// recordRadix's internal barriers only sync compute -> compute; the final scatter's
-		// write to valBufferA must also be made visible to the transfer stage before the copy below.
-		const vk::MemoryBarrier2 toTransferBarrier{
-		    .srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader,
-		    .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-		    .dstStageMask  = vk::PipelineStageFlagBits2::eTransfer,
-		    .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
-		commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toTransferBarrier});
-
-		// 3) Copy the sorted splat indices (only the first splatCount matter) into the draw-time index buffer.
-		commandBuffer.copyBuffer(*rf.valBufferA, *indexBuffers[frameIndex], vk::BufferCopy(0, 0, sizeof(uint32_t) * splatCount));
-
-		const vk::MemoryBarrier2 toVertexBarrier{
-		    .srcStageMask  = vk::PipelineStageFlagBits2::eTransfer,
-		    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-		    .dstStageMask  = vk::PipelineStageFlagBits2::eVertexShader,
-		    .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead};
-		commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toVertexBarrier});
 	}
 
 	void recordCommandBuffer(uint32_t imageIndex)
@@ -1452,9 +888,9 @@ class Application
 		commandBuffer.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, timestampQueryPool, qBase + 0);
 
 		if (sortMode == SortMode::Gpu)
-			recordSort();
+			bitonicSorter.record(commandBuffer, frameIndex, viewRow2, splatCount, paddedCount);
 		else if (sortMode == SortMode::Radix)
-			recordRadixSort();
+			radixSorter.record(commandBuffer, frameIndex, viewRow2, splatCount, indexBuffers[frameIndex]);
 
 		// eBottomOfPipe so this only fires once all prior work (the sort, if any) has actually
 		// finished -- eTopOfPipe would fire as soon as the command is dispatched, before that.
@@ -1696,14 +1132,6 @@ class Application
 		frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
 	}
 
-	[[nodiscard]] vk::raii::ShaderModule createShaderModule(const std::vector<char> &code) const
-	{
-		vk::ShaderModuleCreateInfo createInfo{.codeSize = code.size(), .pCode = reinterpret_cast<const uint32_t *>(code.data())};
-		vk::raii::ShaderModule     shaderModule{device, createInfo};
-
-		return shaderModule;
-	}
-
 	static uint32_t chooseSwapMinImageCount(vk::SurfaceCapabilitiesKHR const &surfaceCapabilities)
 	{
 		auto minImageCount = std::max(3u, surfaceCapabilities.minImageCount);
@@ -1776,19 +1204,6 @@ class Application
 		return vk::False;
 	}
 
-	static std::vector<char> readFile(const std::string &filename)
-	{
-		std::ifstream file(filename, std::ios::ate | std::ios::binary);
-		if (!file.is_open())
-		{
-			throw std::runtime_error("failed to open file!");
-		}
-		std::vector<char> buffer(file.tellg());
-		file.seekg(0, std::ios::beg);
-		file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-		file.close();
-		return buffer;
-	}
 };
 
 int main(int argc, char **argv)
