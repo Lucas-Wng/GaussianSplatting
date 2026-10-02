@@ -16,7 +16,10 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../cmake")
 
 find_package(glfw3 REQUIRED)
 find_package(glm REQUIRED)
-find_package(Vulkan 1.4.335 REQUIRED)
+# 1.4 (not a specific patch) is the real floor: vk::ApiVersion14 needs headers generated for
+# the Vulkan 1.4 spec. The exact patch available varies by how Vulkan was installed (a direct
+# LunarG SDK install vs. a distro/package-manager build), and nothing here depends on one.
+find_package(Vulkan 1.4 REQUIRED)
 
 # Set up Vulkan C++ module only if enabled
 if(ENABLE_CPP20_MODULE)

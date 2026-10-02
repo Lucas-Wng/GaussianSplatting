@@ -201,7 +201,7 @@ class RadixSorter
 		cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toTransferBarrier});
 
 		// 3) Copy the sorted splat indices (only the first splatCount matter) into the draw-time index buffer.
-		cmd.copyBuffer(*rf.valBufferA, *outIndexBuffer, vk::BufferCopy(0, 0, sizeof(uint32_t) * splatCount));
+		cmd.copyBuffer(*rf.valBufferA, *outIndexBuffer, vk::BufferCopy{.srcOffset = 0, .dstOffset = 0, .size = sizeof(uint32_t) * splatCount});
 
 		const vk::MemoryBarrier2 toVertexBarrier{
 		    .srcStageMask  = vk::PipelineStageFlagBits2::eTransfer,

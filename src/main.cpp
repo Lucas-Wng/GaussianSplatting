@@ -919,8 +919,8 @@ class Application
 		    .pColorAttachments    = &attachmentInfo};
 		commandBuffer.beginRendering(renderingInfo);
 		commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *graphicsPipeline);
-		commandBuffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
-		commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
+		commandBuffer.setViewport(0, vk::Viewport{.x = 0.0f, .y = 0.0f, .width = static_cast<float>(swapChainExtent.width), .height = static_cast<float>(swapChainExtent.height), .minDepth = 0.0f, .maxDepth = 1.0f});
+		commandBuffer.setScissor(0, vk::Rect2D{.offset = vk::Offset2D{.x = 0, .y = 0}, .extent = swapChainExtent});
 		commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, *descriptorSets[frameIndex], nullptr);
 		// One instanced quad (4-vert triangle strip) per splat.
 		commandBuffer.draw(4, splatCount, 0, 0);

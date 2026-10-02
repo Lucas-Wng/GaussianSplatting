@@ -45,7 +45,7 @@ the bitonic sort, at this splat count.
 
 ## Requirements
 
-- Vulkan SDK 1.4.335+ (provides `slangc`)
+- Vulkan SDK 1.4+ (provides `slangc`)
 - `glfw`
 - `glm`
 
