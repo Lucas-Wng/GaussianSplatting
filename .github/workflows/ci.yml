@@ -54,8 +54,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libglfw3-dev libglm-dev libvulkan-dev \
-            mesa-vulkan-drivers vulkan-tools xvfb unzip
+          sudo apt-get install -y libglfw3-dev libglm-dev mesa-vulkan-drivers vulkan-tools xvfb unzip wget
+
+          # Ubuntu's own libvulkan-dev is too old to satisfy CMakeLists.txt's
+          # find_package(Vulkan 1.4.335 REQUIRED); pull a current Vulkan SDK from LunarG's
+          # apt repo instead (mesa-vulkan-drivers above still provides the lavapipe ICD).
+          codename="$(lsb_release -cs)"
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | gpg --dearmor | sudo tee /etc/apt/trusted.gpg.d/lunarg.gpg > /dev/null
+          sudo wget -qO "/etc/apt/sources.list.d/lunarg-vulkan-${codename}.list" "https://packages.lunarg.com/vulkan/lunarg-vulkan-${codename}.list"
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk
 
       - name: Install slangc
         env:
